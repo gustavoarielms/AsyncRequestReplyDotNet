@@ -1,0 +1,32 @@
+name: Example Tests
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  example-tests:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Restore dependencies
+        run: dotnet restore
+
+      - name: Build solution
+        run: dotnet build --configuration Release --no-restore
+
+      - name: Run tests
+        run: dotnet test --configuration Release --no-build
+
+      - name: Pack library
+        run: dotnet pack src/Patxa.AsyncRequestReply/Patxa.AsyncRequestReply.csproj --configuration Release --no-build --output ./artifacts

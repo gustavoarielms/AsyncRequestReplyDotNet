@@ -1,0 +1,52 @@
+name: Release Please
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+    permissions:
+      contents: write
+      pull-requests: write
+
+    steps:
+      - name: Run release-please
+        id: release
+        uses: googleapis/release-please-action@v4
+        with:
+          release-type: simple
+          package-name: Patxa.AsyncRequestReply
+
+      - name: Checkout repository
+        if: ${{ steps.release.outputs.release_created == 'true' }}
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        if: ${{ steps.release.outputs.release_created == 'true' }}
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Restore dependencies
+        if: ${{ steps.release.outputs.release_created == 'true' }}
+        run: dotnet restore
+
+      - name: Build solution
+        if: ${{ steps.release.outputs.release_created == 'true' }}
+        run: dotnet build --configuration Release --no-restore
+
+      - name: Pack library
+        if: ${{ steps.release.outputs.release_created == 'true' }}
+        run: dotnet pack src/Patxa.AsyncRequestReply/Patxa.AsyncRequestReply.csproj --configuration Release --no-build --output ./artifacts
+
+      - name: Publish to NuGet
+        if: ${{ steps.release.outputs.release_created == 'true' }}
+        run: dotnet nuget push "./artifacts/*.nupkg" --api-key "$NUGET_API_KEY" --source https://api.nuget.org/v3/index.json --skip-duplicate
+        env:
+          NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
