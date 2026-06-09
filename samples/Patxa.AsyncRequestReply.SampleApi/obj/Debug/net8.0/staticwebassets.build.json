@@ -1,0 +1,11 @@
+{
+  "Version": 1,
+  "Hash": "sOlww+gc803nZiVeE1SdTk6yWY9MMSCKDJpnASvXoAo=",
+  "Source": "Patxa.AsyncRequestReply.SampleApi",
+  "BasePath": "_content/Patxa.AsyncRequestReply.SampleApi",
+  "Mode": "Default",
+  "ManifestType": "Build",
+  "ReferencedProjectsConfiguration": [],
+  "DiscoveryPatterns": [],
+  "Assets": []
+}

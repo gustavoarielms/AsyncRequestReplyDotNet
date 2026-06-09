@@ -1,0 +1,100 @@
+{
+  "version": 3,
+  "targets": {
+    "net8.0": {
+      "Patxa.AsyncRequestReply/0.1.0": {
+        "type": "project",
+        "framework": ".NETCoreApp,Version=v8.0",
+        "compile": {
+          "bin/placeholder/Patxa.AsyncRequestReply.dll": {}
+        },
+        "runtime": {
+          "bin/placeholder/Patxa.AsyncRequestReply.dll": {}
+        },
+        "frameworkReferences": [
+          "Microsoft.AspNetCore.App"
+        ]
+      }
+    }
+  },
+  "libraries": {
+    "Patxa.AsyncRequestReply/0.1.0": {
+      "type": "project",
+      "path": "../../src/Patxa.AsyncRequestReply/Patxa.AsyncRequestReply.csproj",
+      "msbuildProject": "../../src/Patxa.AsyncRequestReply/Patxa.AsyncRequestReply.csproj"
+    }
+  },
+  "projectFileDependencyGroups": {
+    "net8.0": [
+      "Patxa.AsyncRequestReply >= 0.1.0"
+    ]
+  },
+  "packageFolders": {
+    "/Users/gustavo/.nuget/packages/": {}
+  },
+  "project": {
+    "version": "1.0.0",
+    "restore": {
+      "projectUniqueName": "/Users/gustavo/Documents/Codex/2026-06-08/s-porque-met-fences-dentro-de/samples/Patxa.AsyncRequestReply.SampleApi/Patxa.AsyncRequestReply.SampleApi.csproj",
+      "projectName": "Patxa.AsyncRequestReply.SampleApi",
+      "projectPath": "/Users/gustavo/Documents/Codex/2026-06-08/s-porque-met-fences-dentro-de/samples/Patxa.AsyncRequestReply.SampleApi/Patxa.AsyncRequestReply.SampleApi.csproj",
+      "packagesPath": "/Users/gustavo/.nuget/packages/",
+      "outputPath": "/Users/gustavo/Documents/Codex/2026-06-08/s-porque-met-fences-dentro-de/samples/Patxa.AsyncRequestReply.SampleApi/obj/",
+      "projectStyle": "PackageReference",
+      "configFilePaths": [
+        "/Users/gustavo/.nuget/NuGet/NuGet.Config"
+      ],
+      "originalTargetFrameworks": [
+        "net8.0"
+      ],
+      "sources": {
+        "https://api.nuget.org/v3/index.json": {}
+      },
+      "frameworks": {
+        "net8.0": {
+          "targetAlias": "net8.0",
+          "projectReferences": {
+            "/Users/gustavo/Documents/Codex/2026-06-08/s-porque-met-fences-dentro-de/src/Patxa.AsyncRequestReply/Patxa.AsyncRequestReply.csproj": {
+              "projectPath": "/Users/gustavo/Documents/Codex/2026-06-08/s-porque-met-fences-dentro-de/src/Patxa.AsyncRequestReply/Patxa.AsyncRequestReply.csproj"
+            }
+          }
+        }
+      },
+      "warningProperties": {
+        "warnAsError": [
+          "NU1605"
+        ]
+      },
+      "restoreAuditProperties": {
+        "enableAudit": "true",
+        "auditLevel": "low",
+        "auditMode": "direct"
+      }
+    },
+    "frameworks": {
+      "net8.0": {
+        "targetAlias": "net8.0",
+        "imports": [
+          "net461",
+          "net462",
+          "net47",
+          "net471",
+          "net472",
+          "net48",
+          "net481"
+        ],
+        "assetTargetFallback": true,
+        "warn": true,
+        "frameworkReferences": {
+          "Microsoft.AspNetCore.App": {
+            "privateAssets": "none"
+          },
+          "Microsoft.NETCore.App": {
+            "privateAssets": "all"
+          }
+        },
+        "runtimeIdentifierGraphPath": "/usr/local/share/dotnet/sdk/8.0.401/PortableRuntimeIdentifierGraph.json"
+      }
+    }
+  }
+}

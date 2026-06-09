@@ -1,0 +1,23 @@
+{
+  "runtimeTarget": {
+    "name": ".NETCoreApp,Version=v8.0",
+    "signature": ""
+  },
+  "compilationOptions": {},
+  "targets": {
+    ".NETCoreApp,Version=v8.0": {
+      "Patxa.AsyncRequestReply/0.1.0": {
+        "runtime": {
+          "Patxa.AsyncRequestReply.dll": {}
+        }
+      }
+    }
+  },
+  "libraries": {
+    "Patxa.AsyncRequestReply/0.1.0": {
+      "type": "project",
+      "serviceable": false,
+      "sha512": ""
+    }
+  }
+}
