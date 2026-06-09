@@ -1,0 +1,40 @@
+# Build output
+bin/
+obj/
+out/
+
+# Test and coverage output
+TestResults/
+*.trx
+*.coverage
+*.coveragexml
+coverage/
+coverage-*/
+*.cobertura.xml
+
+# NuGet packages and generated package artifacts
+*.nupkg
+*.snupkg
+packages/
+project.lock.json
+project.assets.json
+
+# IDE and editor files
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Local tooling and generated workspace output
+.codegraph/
+outputs/
+work/
