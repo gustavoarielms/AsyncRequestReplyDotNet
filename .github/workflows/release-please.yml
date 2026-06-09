@@ -21,7 +21,7 @@ jobs:
         uses: googleapis/release-please-action@v4
         with:
           release-type: simple
-          package-name: Patxa.AsyncRequestReply
+          package-name: AsyncRequestReply
 
       - name: Checkout repository
         if: ${{ steps.release.outputs.release_created == 'true' }}
@@ -43,7 +43,7 @@ jobs:
 
       - name: Pack library
         if: ${{ steps.release.outputs.release_created == 'true' }}
-        run: dotnet pack src/Patxa.AsyncRequestReply/Patxa.AsyncRequestReply.csproj --configuration Release --no-build --output ./artifacts
+        run: dotnet pack src/AsyncRequestReply/AsyncRequestReply.csproj --configuration Release --no-build --output ./artifacts
 
       - name: Publish to NuGet
         if: ${{ steps.release.outputs.release_created == 'true' }}

@@ -1,3 +1,0 @@
-﻿<Project>
-  <Import Project="../build/Patxa.AsyncRequestReply.SampleApi.props" />
-</Project>

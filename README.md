@@ -1,6 +1,6 @@
-# Patxa.AsyncRequestReply
+# AsyncRequestReply
 
-`Patxa.AsyncRequestReply` is a minimal ASP.NET Core library for the Asynchronous Request-Reply pattern.
+`AsyncRequestReply` is a minimal ASP.NET Core library for the Asynchronous Request-Reply pattern.
 
 It lets an HTTP endpoint accept work, enqueue it, return `202 Accepted` immediately, and expose a polling endpoint where clients can check the job status later. The library owns the HTTP pattern and status contract. The host application owns the real business processing.
 
@@ -11,19 +11,19 @@ This first version uses in-memory queue and status store implementations. Redis,
 Build the NuGet package locally:
 
 ```bash
-dotnet pack src/Patxa.AsyncRequestReply/Patxa.AsyncRequestReply.csproj -c Release
+dotnet pack src/AsyncRequestReply/AsyncRequestReply.csproj -c Release
 ```
 
 Install it from the generated package folder:
 
 ```bash
-dotnet add package Patxa.AsyncRequestReply --source ./src/Patxa.AsyncRequestReply/bin/Release
+dotnet add package AsyncRequestReply --source ./src/AsyncRequestReply/bin/Release
 ```
 
 ## ASP.NET Core configuration
 
 ```csharp
-using Patxa.AsyncRequestReply;
+using AsyncRequestReply;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -74,7 +74,7 @@ With `PayloadPath = "data"`, this request enqueues only the nested `data` object
 ## Processor example
 
 ```csharp
-using Patxa.AsyncRequestReply;
+using AsyncRequestReply;
 
 public sealed class OrderProcessor : IAsyncJobProcessor
 {
@@ -126,5 +126,5 @@ Supported statuses are `queued`, `processing`, `waiting_external`, `completed`, 
 ```bash
 dotnet build
 dotnet test
-dotnet pack src/Patxa.AsyncRequestReply/Patxa.AsyncRequestReply.csproj -c Release
+dotnet pack src/AsyncRequestReply/AsyncRequestReply.csproj -c Release
 ```

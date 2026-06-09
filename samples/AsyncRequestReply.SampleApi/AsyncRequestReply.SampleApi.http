@@ -1,0 +1,6 @@
+@AsyncRequestReply.SampleApi_HostAddress = http://localhost:0
+
+GET {{AsyncRequestReply.SampleApi_HostAddress}}/weatherforecast/
+Accept: application/json
+
+###

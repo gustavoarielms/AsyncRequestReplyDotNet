@@ -1,6 +1,0 @@
-@Patxa.AsyncRequestReply.SampleApi_HostAddress = http://localhost:0
-
-GET {{Patxa.AsyncRequestReply.SampleApi_HostAddress}}/weatherforecast/
-Accept: application/json
-
-###
