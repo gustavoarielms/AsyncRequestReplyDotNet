@@ -8,7 +8,7 @@ on:
 
 jobs:
   release-please:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
     permissions:
@@ -35,11 +35,15 @@ jobs:
 
       - name: Restore dependencies
         if: ${{ steps.release.outputs.release_created == 'true' }}
-        run: dotnet restore
+        run: dotnet restore AsyncRequestReply.sln
 
       - name: Build solution
         if: ${{ steps.release.outputs.release_created == 'true' }}
-        run: dotnet build --configuration Release --no-restore
+        run: dotnet build AsyncRequestReply.sln --configuration Release --no-restore
+
+      - name: Run tests
+        if: ${{ steps.release.outputs.release_created == 'true' }}
+        run: dotnet test AsyncRequestReply.sln --configuration Release --no-build
 
       - name: Pack library
         if: ${{ steps.release.outputs.release_created == 'true' }}
