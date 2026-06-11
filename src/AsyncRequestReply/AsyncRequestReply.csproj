@@ -6,10 +6,13 @@
     <Nullable>enable</Nullable>
     <PackageId>AsyncRequestReply</PackageId>
     <Version>0.1.0</Version>
+    <Authors>Gustavo Ariel M. S.</Authors>
     <Description>ASP.NET Core helpers for asynchronous request-reply HTTP flows.</Description>
     <PackageReadmeFile>README.md</PackageReadmeFile>
-    <RepositoryUrl>https://github.com/gustavoarielms/asynchronous-request-reply-pattern-nestjs-example</RepositoryUrl>
+    <PackageProjectUrl>https://github.com/gustavoarielms/AsyncRequestReplyDotNet</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/gustavoarielms/AsyncRequestReplyDotNet</RepositoryUrl>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageTags>aspnetcore;async;request-reply;background-jobs;http</PackageTags>
   </PropertyGroup>
 
   <ItemGroup>

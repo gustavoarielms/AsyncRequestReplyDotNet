@@ -1,0 +1,44 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Restore dependencies
+        run: dotnet restore AsyncRequestReply.sln
+
+      - name: Build solution
+        run: dotnet build AsyncRequestReply.sln --configuration Release --no-restore
+
+      - name: Run tests
+        run: dotnet test AsyncRequestReply.sln --configuration Release --no-build
+
+      - name: Pack library
+        run: dotnet pack src/AsyncRequestReply/AsyncRequestReply.csproj --configuration Release --no-build --output ./artifacts
+
+      - name: NuGet login
+        id: login
+        uses: NuGet/login@v1
+        with:
+          user: gustavoarielms
+
+      - name: Publish to NuGet
+        run: dotnet nuget push ./artifacts/*.nupkg --api-key "${{ steps.login.outputs.NUGET_API_KEY }}" --source https://api.nuget.org/v3/index.json --skip-duplicate
