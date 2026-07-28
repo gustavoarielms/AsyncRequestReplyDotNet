@@ -35,6 +35,5 @@ project.assets.json
 Thumbs.db
 
 # Local tooling and generated workspace output
-.codegraph/
 outputs/
 work/
