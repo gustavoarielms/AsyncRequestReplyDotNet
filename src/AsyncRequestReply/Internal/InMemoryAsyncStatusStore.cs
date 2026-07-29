@@ -25,10 +25,8 @@ internal sealed class InMemoryAsyncStatusStore : IAsyncStatusStore, IAsyncStatus
 
         lock (writeLock)
         {
-            RemoveExpired(DateTimeOffset.UtcNow);
-
             return Task.FromResult(
-                entries.TryGetValue(jobId, out var entry)
+                TryGetLiveEntry(jobId, DateTimeOffset.UtcNow, out var entry)
                     ? entry.Status
                     : null);
         }
@@ -149,17 +147,16 @@ internal sealed class InMemoryAsyncStatusStore : IAsyncStatusStore, IAsyncStatus
         CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
+        var tokenHash = StatusAccessToken.Hash(accessToken);
 
         lock (writeLock)
         {
-            RemoveExpired(DateTimeOffset.UtcNow);
-
             return Task.FromResult(
-                entries.TryGetValue(jobId, out var entry)
+                TryGetLiveEntry(jobId, DateTimeOffset.UtcNow, out var entry)
                 && entry.TokenHash is not null
                 && CryptographicOperations.FixedTimeEquals(
                     entry.TokenHash,
-                    StatusAccessToken.Hash(accessToken)));
+                    tokenHash));
         }
     }
 
@@ -207,5 +204,22 @@ internal sealed class InMemoryAsyncStatusStore : IAsyncStatusStore, IAsyncStatus
                 entries.Remove(pair.Key);
             }
         }
+    }
+
+    private bool TryGetLiveEntry(string jobId, DateTimeOffset now, out Entry entry)
+    {
+        if (!entries.TryGetValue(jobId, out entry!))
+        {
+            return false;
+        }
+
+        if (entry.ExpiresAt is not { } expiresAt || expiresAt > now)
+        {
+            return true;
+        }
+
+        entries.Remove(jobId);
+        entry = null!;
+        return false;
     }
 }

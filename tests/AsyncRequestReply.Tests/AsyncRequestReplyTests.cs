@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Net;
 using System.Net.Http.Json;
 using System.Runtime.CompilerServices;
@@ -472,6 +473,130 @@ public sealed class AsyncRequestReplyTests
     }
 
     [Fact]
+    public async Task ProcessorCompletionRetentionFailure_RedeliversWithoutOverwritingCompletedStatus()
+    {
+        var queue = new TestQueue();
+        var store = new RetentionFailingStore();
+        var processor = new CountingProcessor();
+        await using var app = await TestApp.StartAsync(
+            processor,
+            services =>
+            {
+                services.AddSingleton<IAsyncJobQueue>(queue);
+                services.AddSingleton<IAsyncJobQueueReader>(queue);
+                services.AddSingleton<IAsyncStatusStore>(store);
+                services.AddSingleton<IAsyncStatusTokenStore>(store);
+                services.AddSingleton<IAsyncJobSubmissionStore>(
+                    new TestSubmissionStore(queue, store, store));
+            });
+
+        var accepted = await PostOrderAsync(app.Client);
+        await store.RetentionRecovered.Task.WaitAsync(
+            TimeSpan.FromSeconds(5),
+            TestContext.Current.CancellationToken);
+        var status = await PollStatusAsync(app.Client, accepted.Location, AsyncJobStatus.completed);
+
+        Assert.Equal(AsyncJobStatus.completed, status.Status);
+        Assert.Equal(1, processor.Calls);
+        Assert.True(store.TokenRetentionAttempts >= 2);
+    }
+
+    [Fact]
+    public async Task ExternalCompletionRetentionFailure_RedeliversWithoutInvokingResolverAgain()
+    {
+        var queue = new TestQueue();
+        var store = new RetentionFailingStore();
+        var resolver = new CapturingResolver(status => status with
+        {
+            Status = AsyncJobStatus.completed,
+            Result = "resolved",
+            UpdatedAt = DateTimeOffset.UtcNow
+        });
+        await using var app = await TestApp.StartAsync(
+            configureServices: services =>
+            {
+                services.AddSingleton<IAsyncJobQueue>(queue);
+                services.AddSingleton<IAsyncJobQueueReader>(queue);
+                services.AddSingleton<IAsyncStatusStore>(store);
+                services.AddSingleton<IAsyncStatusTokenStore>(store);
+                services.AddSingleton<IAsyncJobSubmissionStore>(
+                    new TestSubmissionStore(queue, store, store));
+                services.AddSingleton<IExternalStatusResolver>(resolver);
+            },
+            configureOptions: options => options.ExternalResolutionMaxAttempts = 1,
+            configureEndpoint: options => options.ExecutionMode = AsyncExecutionMode.wait_external);
+
+        var accepted = await PostOrderAsync(app.Client);
+        await store.RetentionRecovered.Task.WaitAsync(
+            TimeSpan.FromSeconds(5),
+            TestContext.Current.CancellationToken);
+        var status = await PollStatusAsync(app.Client, accepted.Location, AsyncJobStatus.completed);
+
+        Assert.Equal(AsyncJobStatus.completed, status.Status);
+        Assert.Equal(1, resolver.Calls);
+        Assert.True(store.TokenRetentionAttempts >= 2);
+    }
+
+    [Fact]
+    public async Task RecoveredExternalDelivery_PreservesPersistedWaitingExternalProgress()
+    {
+        const string jobId = "external-progress";
+        var queue = new TestQueue();
+        var observedStatuses = new List<AsyncStatusResponse>();
+        var resolver = new CapturingResolver(status =>
+        {
+            observedStatuses.Add(status);
+            return status with
+            {
+                Status = AsyncJobStatus.completed,
+                Result = "completed",
+                Error = null,
+                UpdatedAt = DateTimeOffset.UtcNow
+            };
+        });
+        await using var app = await TestApp.StartAsync(
+            configureServices: services =>
+            {
+                services.AddSingleton<IAsyncJobQueue>(queue);
+                services.AddSingleton<IAsyncJobQueueReader>(queue);
+                services.AddSingleton<IAsyncJobSubmissionStore>(provider =>
+                    new TestSubmissionStore(
+                        queue,
+                        provider.GetRequiredService<IAsyncStatusStore>(),
+                        provider.GetRequiredService<IAsyncStatusTokenStore>()));
+                services.AddSingleton<IExternalStatusResolver>(resolver);
+            });
+        var createdAt = DateTimeOffset.UtcNow.AddMinutes(-5);
+        var updatedAt = DateTimeOffset.UtcNow.AddMinutes(-1);
+        await app.StatusStore.SetAsync(
+            new AsyncStatusResponse(
+                jobId,
+                AsyncJobStatus.waiting_external,
+                "cursor-42",
+                "still-running",
+                createdAt,
+                updatedAt),
+            TestContext.Current.CancellationToken);
+
+        await queue.EnqueueAsync(
+            jobId,
+            new { value = 1 },
+            AsyncExecutionMode.wait_external,
+            TestContext.Current.CancellationToken);
+        var status = await PollStoredStatusAsync(
+            app.StatusStore,
+            jobId,
+            AsyncJobStatus.completed);
+
+        Assert.Equal(AsyncJobStatus.completed, status.Status);
+        var observed = Assert.Single(observedStatuses);
+        Assert.Equal("cursor-42", observed.Result);
+        Assert.Equal("still-running", observed.Error);
+        Assert.Equal(createdAt, observed.CreatedAt);
+        Assert.Equal(updatedAt, observed.UpdatedAt);
+    }
+
+    [Fact]
     public void InvalidOptions_AreRejected()
     {
         var services = new ServiceCollection();
@@ -481,6 +606,49 @@ public sealed class AsyncRequestReplyTests
 
         Assert.Throws<OptionsValidationException>(
             () => provider.GetRequiredService<IOptions<AsyncRequestReplyOptions>>().Value);
+    }
+
+    [Fact]
+    public async Task InMemoryStatusPollingAllocations_DoNotScaleWithStoreSize()
+    {
+        var services = new ServiceCollection();
+        services.AddLogging();
+        services.AddAsyncRequestReply(options => options.StatusCapacity = 1_000);
+        using var provider = services.BuildServiceProvider();
+        var statusStore = provider.GetRequiredService<IAsyncStatusStore>();
+        var tokenStore = provider.GetRequiredService<IAsyncStatusTokenStore>();
+
+        await statusStore.SetAsync(
+            StatusResponseFactoryForTest("target", AsyncJobStatus.processing),
+            TestContext.Current.CancellationToken);
+        await tokenStore.SetAsync(
+            "target",
+            "secret",
+            TestContext.Current.CancellationToken);
+        var smallStoreAllocations = await MeasureStatusPollingAllocations(
+            statusStore,
+            tokenStore,
+            "target",
+            "secret",
+            TestContext.Current.CancellationToken);
+
+        for (var index = 1; index < 1_000; index++)
+        {
+            await statusStore.SetAsync(
+                StatusResponseFactoryForTest($"job-{index}", AsyncJobStatus.processing),
+                TestContext.Current.CancellationToken);
+        }
+
+        var largeStoreAllocations = await MeasureStatusPollingAllocations(
+            statusStore,
+            tokenStore,
+            "target",
+            "secret",
+            TestContext.Current.CancellationToken);
+
+        Assert.True(
+            largeStoreAllocations <= smallStoreAllocations + (256 * 1024),
+            $"Polling allocations grew from {smallStoreAllocations} to {largeStoreAllocations} bytes.");
     }
 
     [Fact]
@@ -753,6 +921,98 @@ public sealed class AsyncRequestReplyTests
                     $"{statusPrefix}access:job-1",
                     $"{statusPrefix}job-2",
                     $"{statusPrefix}access:job-2"
+                ]);
+        }
+    }
+
+    [Fact]
+    [Trait("Category", "RedisIntegration")]
+    public async Task RedisSubmission_EnqueueTimeoutBoundsInFlightCommandAndRemainsIdempotent()
+    {
+        var configuration = Environment.GetEnvironmentVariable("ASYNC_REQUEST_REPLY_REDIS_CONNECTION");
+
+        if (string.IsNullOrWhiteSpace(configuration))
+        {
+            Assert.Skip("Set ASYNC_REQUEST_REPLY_REDIS_CONNECTION to run the Redis integration test.");
+        }
+
+        var suffix = Guid.NewGuid().ToString("N");
+        var streamKey = $"async-request-reply:{{{suffix}}}:jobs";
+        var statusPrefix = $"async-request-reply:{{{suffix}}}:status:";
+        var services = new ServiceCollection();
+        services.AddLogging();
+        services.AddAsyncRequestReply(options =>
+        {
+            options.EnqueueTimeout = TimeSpan.FromMilliseconds(200);
+        });
+        services.AddAsyncRequestReplyRedis(options =>
+        {
+            options.Configuration = configuration;
+            options.StreamKey = streamKey;
+            options.ConsumerGroup = $"group-{suffix}";
+            options.StatusKeyPrefix = statusPrefix;
+            options.MaxQueueLength = 10;
+        });
+        await using var provider = services.BuildServiceProvider();
+        var submissionStore = provider.GetRequiredService<IAsyncJobSubmissionStore>();
+        var statusStore = provider.GetRequiredService<IAsyncStatusStore>();
+        var tokenStore = provider.GetRequiredService<IAsyncStatusTokenStore>();
+        var connection = provider.GetRequiredService<StackExchange.Redis.IConnectionMultiplexer>();
+        var database = connection.GetDatabase();
+        var adminOptions = StackExchange.Redis.ConfigurationOptions.Parse(configuration);
+        adminOptions.AllowAdmin = true;
+        await using var adminConnection =
+            await StackExchange.Redis.ConnectionMultiplexer.ConnectAsync(adminOptions);
+        var server = adminConnection.GetServer(adminConnection.GetEndPoints().Single());
+
+        try
+        {
+            await server.ExecuteAsync("CLIENT", "PAUSE", 1_500, "ALL");
+            var elapsed = Stopwatch.StartNew();
+
+            await Assert.ThrowsAsync<AsyncQueueUnavailableException>(
+                () => submissionStore.SubmitAsync(
+                    "job-1",
+                    new { value = 1 },
+                    AsyncExecutionMode.resolve_now,
+                    "secret-1",
+                    TestContext.Current.CancellationToken).AsTask());
+            elapsed.Stop();
+
+            Assert.True(
+                elapsed.Elapsed < TimeSpan.FromSeconds(1),
+                $"Submission exceeded its timeout budget: {elapsed.Elapsed}.");
+
+            await Task.Delay(
+                TimeSpan.FromMilliseconds(1_500),
+                TestContext.Current.CancellationToken);
+
+            Assert.Equal(1, await database.StreamLengthAsync(streamKey));
+            Assert.NotNull(await statusStore.GetAsync(
+                "job-1",
+                TestContext.Current.CancellationToken));
+            Assert.True(await tokenStore.ValidateAsync(
+                "job-1",
+                "secret-1",
+                TestContext.Current.CancellationToken));
+
+            await submissionStore.SubmitAsync(
+                "job-1",
+                new { value = 1 },
+                AsyncExecutionMode.resolve_now,
+                "secret-1",
+                TestContext.Current.CancellationToken);
+
+            Assert.Equal(1, await database.StreamLengthAsync(streamKey));
+        }
+        finally
+        {
+            await server.ExecuteAsync("CLIENT", "UNPAUSE");
+            await database.KeyDeleteAsync(
+                [
+                    streamKey,
+                    $"{statusPrefix}job-1",
+                    $"{statusPrefix}access:job-1"
                 ]);
         }
     }
@@ -1045,6 +1305,48 @@ public sealed class AsyncRequestReplyTests
         throw new TimeoutException($"Status did not become {expectedStatus}.");
     }
 
+    private static async Task<AsyncStatusResponse> PollStoredStatusAsync(
+        IAsyncStatusStore statusStore,
+        string jobId,
+        AsyncJobStatus expectedStatus)
+    {
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+
+        while (!timeout.IsCancellationRequested)
+        {
+            var status = await statusStore.GetAsync(jobId, timeout.Token);
+
+            if (status?.Status == expectedStatus)
+            {
+                return status;
+            }
+
+            await Task.Delay(50, timeout.Token);
+        }
+
+        throw new TimeoutException($"Stored status did not become {expectedStatus}.");
+    }
+
+    private static async Task<long> MeasureStatusPollingAllocations(
+        IAsyncStatusStore statusStore,
+        IAsyncStatusTokenStore tokenStore,
+        string jobId,
+        string accessToken,
+        CancellationToken cancellationToken)
+    {
+        await statusStore.GetAsync(jobId, cancellationToken);
+        await tokenStore.ValidateAsync(jobId, accessToken, cancellationToken);
+        var before = GC.GetAllocatedBytesForCurrentThread();
+
+        for (var index = 0; index < 50; index++)
+        {
+            await statusStore.GetAsync(jobId, cancellationToken);
+            await tokenStore.ValidateAsync(jobId, accessToken, cancellationToken);
+        }
+
+        return GC.GetAllocatedBytesForCurrentThread() - before;
+    }
+
     private static async Task<AsyncJobDelivery> ReadOneAsync(IAsyncJobQueueReader reader)
     {
         using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
@@ -1117,6 +1419,129 @@ public sealed class AsyncRequestReplyTests
         {
             Interlocked.Increment(ref calls);
             return Task.FromResult(resolve(currentStatus));
+        }
+    }
+
+    private sealed class RetentionFailingStore : IAsyncStatusStore, IAsyncStatusTokenStore
+    {
+        private readonly Dictionary<string, AsyncStatusResponse> statuses = new();
+        private readonly Dictionary<string, string> accessTokens = new();
+        private readonly object gate = new();
+        private int tokenRetentionAttempts;
+
+        public int TokenRetentionAttempts => Volatile.Read(ref tokenRetentionAttempts);
+
+        public TaskCompletionSource RetentionRecovered { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public Task<AsyncStatusResponse?> GetAsync(
+            string jobId,
+            CancellationToken cancellationToken = default)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            lock (gate)
+            {
+                return Task.FromResult(
+                    statuses.TryGetValue(jobId, out var status)
+                        ? status
+                        : null);
+            }
+        }
+
+        public Task SetAsync(
+            AsyncStatusResponse status,
+            CancellationToken cancellationToken = default)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            lock (gate)
+            {
+                statuses[status.Id] = status;
+            }
+
+            return Task.CompletedTask;
+        }
+
+        public Task BeginRetentionAsync(
+            string jobId,
+            CancellationToken cancellationToken = default)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            return Task.CompletedTask;
+        }
+
+        public Task DeleteAsync(
+            string jobId,
+            CancellationToken cancellationToken = default)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            lock (gate)
+            {
+                statuses.Remove(jobId);
+            }
+
+            return Task.CompletedTask;
+        }
+
+        Task IAsyncStatusTokenStore.SetAsync(
+            string jobId,
+            string accessToken,
+            CancellationToken cancellationToken)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            lock (gate)
+            {
+                accessTokens[jobId] = accessToken;
+            }
+
+            return Task.CompletedTask;
+        }
+
+        Task<bool> IAsyncStatusTokenStore.ValidateAsync(
+            string jobId,
+            string accessToken,
+            CancellationToken cancellationToken)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            lock (gate)
+            {
+                return Task.FromResult(
+                    accessTokens.TryGetValue(jobId, out var stored)
+                    && string.Equals(stored, accessToken, StringComparison.Ordinal));
+            }
+        }
+
+        Task IAsyncStatusTokenStore.BeginRetentionAsync(
+            string jobId,
+            CancellationToken cancellationToken)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            if (Interlocked.Increment(ref tokenRetentionAttempts) == 1)
+            {
+                throw new InvalidOperationException("Injected capability retention failure.");
+            }
+
+            RetentionRecovered.TrySetResult();
+            return Task.CompletedTask;
+        }
+
+        Task IAsyncStatusTokenStore.DeleteAsync(
+            string jobId,
+            CancellationToken cancellationToken)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            lock (gate)
+            {
+                accessTokens.Remove(jobId);
+            }
+
+            return Task.CompletedTask;
         }
     }
 

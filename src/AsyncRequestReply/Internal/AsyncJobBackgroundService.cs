@@ -116,7 +116,7 @@ internal sealed class AsyncJobBackgroundService(
 
         if (job.ExecutionMode == AsyncExecutionMode.wait_external)
         {
-            return await ResolveExternalAsync(job, createdAt, cancellationToken);
+            return await ResolveExternalAsync(job, current, createdAt, cancellationToken);
         }
 
         var processor = processors.FirstOrDefault();
@@ -136,16 +136,11 @@ internal sealed class AsyncJobBackgroundService(
             createdAt,
             SystemClock.UtcNow()), cancellationToken);
 
+        object? result;
+
         try
         {
-            var result = await processor.ProcessAsync(job.Id, job.Payload, cancellationToken);
-            await SetStatusAsync(new AsyncStatusResponse(
-                job.Id,
-                AsyncJobStatus.completed,
-                result,
-                null,
-                createdAt,
-                SystemClock.UtcNow()), cancellationToken);
+            result = await processor.ProcessAsync(job.Id, job.Payload, cancellationToken);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
@@ -161,24 +156,43 @@ internal sealed class AsyncJobBackgroundService(
                 $"Job processing failed. Reference: {job.Id}.",
                 createdAt,
                 SystemClock.UtcNow()), cancellationToken);
+            return true;
         }
+
+        await SetStatusAsync(new AsyncStatusResponse(
+            job.Id,
+            AsyncJobStatus.completed,
+            result,
+            null,
+            createdAt,
+            SystemClock.UtcNow()), cancellationToken);
 
         return true;
     }
 
     private async Task<bool> ResolveExternalAsync(
         AsyncJobEnvelope job,
+        AsyncStatusResponse? persistedStatus,
         DateTimeOffset createdAt,
         CancellationToken cancellationToken)
     {
-        var currentStatus = new AsyncStatusResponse(
-            job.Id,
-            AsyncJobStatus.waiting_external,
-            null,
-            null,
-            createdAt,
-            SystemClock.UtcNow());
-        await SetStatusAsync(currentStatus, cancellationToken);
+        AsyncStatusResponse currentStatus;
+
+        if (persistedStatus?.Status == AsyncJobStatus.waiting_external)
+        {
+            currentStatus = persistedStatus;
+        }
+        else
+        {
+            currentStatus = new AsyncStatusResponse(
+                job.Id,
+                AsyncJobStatus.waiting_external,
+                null,
+                null,
+                createdAt,
+                SystemClock.UtcNow());
+            await SetStatusAsync(currentStatus, cancellationToken);
+        }
 
         var resolver = externalResolvers.FirstOrDefault();
 
@@ -192,10 +206,11 @@ internal sealed class AsyncJobBackgroundService(
         {
             using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
             timeout.CancelAfter(options.ExternalResolutionTimeout);
+            AsyncStatusResponse? resolved = null;
 
             try
             {
-                var resolved = await resolver.ResolveAsync(job.Id, currentStatus, timeout.Token);
+                resolved = await resolver.ResolveAsync(job.Id, currentStatus, timeout.Token);
 
                 if (resolved is not null)
                 {
@@ -209,11 +224,7 @@ internal sealed class AsyncJobBackgroundService(
                     {
                         case AsyncJobStatus.completed:
                         case AsyncJobStatus.failed:
-                            await SetStatusAsync(resolved, cancellationToken);
-                            return true;
                         case AsyncJobStatus.waiting_external:
-                            await SetStatusAsync(resolved, cancellationToken);
-                            currentStatus = resolved;
                             break;
                         case AsyncJobStatus.queued:
                         case AsyncJobStatus.processing:
@@ -244,6 +255,19 @@ internal sealed class AsyncJobBackgroundService(
                     "External status resolution attempt {Attempt} failed for job {JobId}.",
                     attempt,
                     job.Id);
+                resolved = null;
+            }
+
+            if (resolved is not null)
+            {
+                await SetStatusAsync(resolved, cancellationToken);
+
+                if (IsTerminal(resolved.Status))
+                {
+                    return true;
+                }
+
+                currentStatus = resolved;
             }
 
             if (attempt < options.ExternalResolutionMaxAttempts)

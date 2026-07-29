@@ -91,12 +91,14 @@ internal sealed class RedisAsyncRequestReplyStore(
         while (true)
         {
             cancellationToken.ThrowIfCancellationRequested();
+            var remaining = enqueueTimeout - elapsed.Elapsed;
 
-            if (lastTransientError is not null && elapsed.Elapsed >= enqueueTimeout)
+            if (remaining <= TimeSpan.Zero)
             {
                 throw new AsyncQueueUnavailableException(
                     "The Redis job stream is temporarily unavailable.",
-                    lastTransientError);
+                    lastTransientError ?? new TimeoutException(
+                        "The Redis submission exceeded its enqueue timeout."));
             }
 
             try
@@ -110,7 +112,7 @@ internal sealed class RedisAsyncRequestReplyStore(
                         statusJson,
                         accessToken is null ? 0 : 1,
                         tokenHash
-                    ]);
+                    ]).WaitAsync(remaining, cancellationToken);
 
                 if ((long)result == 0)
                 {
@@ -119,10 +121,10 @@ internal sealed class RedisAsyncRequestReplyStore(
 
                 return;
             }
-            catch (Exception ex) when (IsTransient(ex))
+            catch (Exception ex) when (ex is TimeoutException || IsTransient(ex))
             {
                 lastTransientError = ex;
-                var remaining = enqueueTimeout - elapsed.Elapsed;
+                remaining = enqueueTimeout - elapsed.Elapsed;
 
                 if (remaining <= TimeSpan.Zero)
                 {
