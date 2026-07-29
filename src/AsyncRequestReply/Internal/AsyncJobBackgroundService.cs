@@ -1,47 +1,110 @@
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
 
 namespace AsyncRequestReply.Internal;
 
 internal sealed class AsyncJobBackgroundService(
-    InMemoryAsyncJobQueue queue,
+    IAsyncJobQueueReader queue,
     IAsyncStatusStore statusStore,
+    IAsyncStatusTokenStore tokenStore,
     IEnumerable<IAsyncJobProcessor> processors,
+    IEnumerable<IExternalStatusResolver> externalResolvers,
+    IOptions<AsyncRequestReplyOptions> requestReplyOptions,
     ILogger<AsyncJobBackgroundService> logger) : BackgroundService
 {
+    private readonly AsyncRequestReplyOptions options = requestReplyOptions.Value;
+
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        await foreach (var job in queue.DequeueAllAsync(stoppingToken))
+        var parallelOptions = new ParallelOptions
         {
-            var processor = processors.FirstOrDefault();
+            CancellationToken = stoppingToken,
+            MaxDegreeOfParallelism = options.WorkerConcurrency
+        };
 
-            if (processor is null)
-            {
-                continue;
-            }
+        try
+        {
+            await Parallel.ForEachAsync(
+                queue.DequeueAllAsync(stoppingToken),
+                parallelOptions,
+                async (delivery, cancellationToken) =>
+                {
+                    using var deliveryCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                    var heartbeat = RenewLeaseAsync(delivery, deliveryCancellation);
 
-            await ProcessJobAsync(job, processor, stoppingToken);
+                    try
+                    {
+                        var completed = await ProcessDeliveryAsync(delivery, deliveryCancellation.Token);
+
+                        if (completed)
+                        {
+                            await queue.CompleteAsync(delivery, deliveryCancellation.Token);
+                        }
+                    }
+                    catch (OperationCanceledException) when (deliveryCancellation.IsCancellationRequested)
+                    {
+                        await TryAbandonAsync(delivery);
+                    }
+                    catch (Exception ex)
+                    {
+                        logger.LogError(
+                            ex,
+                            "Unexpected failure while handling async request-reply delivery {DeliveryId} for job {JobId}.",
+                            delivery.DeliveryId,
+                            delivery.Job.Id);
+                        await TryAbandonAsync(delivery);
+                    }
+                    finally
+                    {
+                        deliveryCancellation.Cancel();
+
+                        try
+                        {
+                            await heartbeat;
+                        }
+                        catch (OperationCanceledException) when (deliveryCancellation.IsCancellationRequested)
+                        {
+                        }
+                        catch (Exception ex)
+                        {
+                            logger.LogWarning(
+                                ex,
+                                "Delivery lease renewal stopped for delivery {DeliveryId} and job {JobId}.",
+                                delivery.DeliveryId,
+                                delivery.Job.Id);
+                        }
+                    }
+                });
+        }
+        catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+        {
         }
     }
 
-    private async Task ProcessJobAsync(AsyncJob job, IAsyncJobProcessor processor, CancellationToken cancellationToken)
+    private async Task<bool> ProcessDeliveryAsync(
+        AsyncJobDelivery delivery,
+        CancellationToken cancellationToken)
     {
+        var job = delivery.Job;
         var current = await statusStore.GetAsync(job.Id, cancellationToken);
         var createdAt = current?.CreatedAt ?? SystemClock.UtcNow();
 
         if (job.ExecutionMode == AsyncExecutionMode.wait_external)
         {
-            await statusStore.SetAsync(new AsyncStatusResponse(
-                job.Id,
-                AsyncJobStatus.waiting_external,
-                null,
-                null,
-                createdAt,
-                SystemClock.UtcNow()), cancellationToken);
-            return;
+            return await ResolveExternalAsync(job, createdAt, cancellationToken);
         }
 
-        await statusStore.SetAsync(new AsyncStatusResponse(
+        var processor = processors.FirstOrDefault();
+
+        if (processor is null)
+        {
+            await queue.AbandonAsync(delivery, cancellationToken);
+            await Task.Delay(options.ExternalResolutionInterval, cancellationToken);
+            return false;
+        }
+
+        await SetStatusAsync(new AsyncStatusResponse(
             job.Id,
             AsyncJobStatus.processing,
             null,
@@ -52,7 +115,7 @@ internal sealed class AsyncJobBackgroundService(
         try
         {
             var result = await processor.ProcessAsync(job.Id, job.Payload, cancellationToken);
-            await statusStore.SetAsync(new AsyncStatusResponse(
+            await SetStatusAsync(new AsyncStatusResponse(
                 job.Id,
                 AsyncJobStatus.completed,
                 result,
@@ -60,16 +123,149 @@ internal sealed class AsyncJobBackgroundService(
                 createdAt,
                 SystemClock.UtcNow()), cancellationToken);
         }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
         catch (Exception ex)
         {
             logger.LogError(ex, "Async request-reply job {JobId} failed.", job.Id);
-            await statusStore.SetAsync(new AsyncStatusResponse(
+            await SetStatusAsync(new AsyncStatusResponse(
                 job.Id,
                 AsyncJobStatus.failed,
                 null,
-                ex.Message,
+                $"Job processing failed. Reference: {job.Id}.",
                 createdAt,
                 SystemClock.UtcNow()), cancellationToken);
+        }
+
+        return true;
+    }
+
+    private async Task<bool> ResolveExternalAsync(
+        AsyncJobEnvelope job,
+        DateTimeOffset createdAt,
+        CancellationToken cancellationToken)
+    {
+        var waiting = new AsyncStatusResponse(
+            job.Id,
+            AsyncJobStatus.waiting_external,
+            null,
+            null,
+            createdAt,
+            SystemClock.UtcNow());
+        await SetStatusAsync(waiting, cancellationToken);
+
+        var resolver = externalResolvers.FirstOrDefault();
+
+        if (resolver is null)
+        {
+            return true;
+        }
+
+        for (var attempt = 1; attempt <= options.ExternalResolutionMaxAttempts; attempt++)
+        {
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            timeout.CancelAfter(options.ExternalResolutionTimeout);
+
+            try
+            {
+                var resolved = await resolver.ResolveAsync(job.Id, waiting, timeout.Token);
+
+                if (resolved is not null)
+                {
+                    if (!string.Equals(resolved.Id, job.Id, StringComparison.Ordinal))
+                    {
+                        throw new InvalidOperationException(
+                            "The external status resolver returned a different job identifier.");
+                    }
+
+                    await SetStatusAsync(resolved, cancellationToken);
+                    return true;
+                }
+            }
+            catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+            {
+                logger.LogWarning(
+                    "External status resolution attempt {Attempt} timed out for job {JobId}.",
+                    attempt,
+                    job.Id);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                logger.LogWarning(
+                    ex,
+                    "External status resolution attempt {Attempt} failed for job {JobId}.",
+                    attempt,
+                    job.Id);
+            }
+
+            if (attempt < options.ExternalResolutionMaxAttempts)
+            {
+                await Task.Delay(options.ExternalResolutionInterval, cancellationToken);
+            }
+        }
+
+        await SetStatusAsync(new AsyncStatusResponse(
+            job.Id,
+            AsyncJobStatus.failed,
+            null,
+            $"External status resolution failed. Reference: {job.Id}.",
+            createdAt,
+            SystemClock.UtcNow()), cancellationToken);
+
+        return true;
+    }
+
+    private async Task SetStatusAsync(
+        AsyncStatusResponse status,
+        CancellationToken cancellationToken)
+    {
+        await statusStore.SetAsync(status, cancellationToken);
+        await tokenStore.RefreshAsync(status.Id, cancellationToken);
+    }
+
+    private async Task RenewLeaseAsync(
+        AsyncJobDelivery delivery,
+        CancellationTokenSource deliveryCancellation)
+    {
+        try
+        {
+            using var timer = new PeriodicTimer(options.DeliveryLeaseRenewalInterval);
+
+            while (await timer.WaitForNextTickAsync(deliveryCancellation.Token))
+            {
+                await queue.RenewAsync(delivery, deliveryCancellation.Token);
+            }
+        }
+        catch (OperationCanceledException) when (deliveryCancellation.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch
+        {
+            deliveryCancellation.Cancel();
+            throw;
+        }
+    }
+
+    private async Task TryAbandonAsync(AsyncJobDelivery delivery)
+    {
+        try
+        {
+            await queue.AbandonAsync(delivery, CancellationToken.None);
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(
+                ex,
+                "Failed to abandon async request-reply delivery {DeliveryId} for job {JobId}.",
+                delivery.DeliveryId,
+                delivery.Job.Id);
         }
     }
 }

@@ -4,10 +4,17 @@ namespace AsyncRequestReply.Internal;
 
 internal static class StatusLocationBuilder
 {
-    public static string Build(IOptions<AsyncRequestReplyOptions> options, string jobId)
+    public static string Build(
+        IOptions<AsyncRequestReplyOptions> options,
+        string jobId,
+        string? accessToken)
     {
         var basePath = NormalizeBasePath(options.Value.StatusBasePath);
-        return $"{basePath}/status/{jobId}";
+        var statusPath = $"{basePath}/status/{jobId}";
+
+        return string.IsNullOrWhiteSpace(accessToken)
+            ? statusPath
+            : $"{statusPath}/{accessToken}";
     }
 
     private static string NormalizeBasePath(string basePath)

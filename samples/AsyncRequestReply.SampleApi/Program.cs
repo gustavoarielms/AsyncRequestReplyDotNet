@@ -5,7 +5,7 @@ var builder = WebApplication.CreateBuilder(args);
 builder.Services.AddAsyncRequestReply(options =>
 {
     options.StatusBasePath = "/async-status";
-    options.ExposeStatusEndpoint = true;
+    options.AllowCapabilityStatusAccess = true;
 });
 builder.Services.AddSingleton<IAsyncJobProcessor, OrderProcessor>();
 
