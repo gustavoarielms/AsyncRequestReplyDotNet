@@ -44,8 +44,10 @@ public static class AsyncRequestReplyServiceCollectionExtensions
         services.TryAddSingleton<InMemoryAsyncJobQueue>();
         services.TryAddSingleton<IAsyncJobQueue>(sp => sp.GetRequiredService<InMemoryAsyncJobQueue>());
         services.TryAddSingleton<IAsyncJobQueueReader>(sp => sp.GetRequiredService<InMemoryAsyncJobQueue>());
-        services.TryAddSingleton<IAsyncStatusStore, InMemoryAsyncStatusStore>();
-        services.TryAddSingleton<IAsyncStatusTokenStore, InMemoryAsyncStatusTokenStore>();
+        services.TryAddSingleton<IAsyncJobSubmissionStore>(sp => sp.GetRequiredService<InMemoryAsyncJobQueue>());
+        services.TryAddSingleton<InMemoryAsyncStatusStore>();
+        services.TryAddSingleton<IAsyncStatusStore>(sp => sp.GetRequiredService<InMemoryAsyncStatusStore>());
+        services.TryAddSingleton<IAsyncStatusTokenStore>(sp => sp.GetRequiredService<InMemoryAsyncStatusStore>());
         services.AddHostedService<AsyncJobBackgroundService>();
 
         return services;

@@ -4,13 +4,20 @@ using Microsoft.Extensions.Options;
 
 namespace AsyncRequestReply.Internal;
 
-internal sealed class InMemoryAsyncJobQueue : IAsyncJobQueue, IAsyncJobQueueReader
+internal sealed class InMemoryAsyncJobQueue :
+    IAsyncJobQueue,
+    IAsyncJobQueueReader,
+    IAsyncJobSubmissionStore
 {
     private readonly Channel<AsyncJobEnvelope> channel;
     private readonly TimeSpan enqueueTimeout;
+    private readonly InMemoryAsyncStatusStore statusStore;
 
-    public InMemoryAsyncJobQueue(IOptions<AsyncRequestReplyOptions> options)
+    public InMemoryAsyncJobQueue(
+        IOptions<AsyncRequestReplyOptions> options,
+        InMemoryAsyncStatusStore statusStore)
     {
+        this.statusStore = statusStore;
         enqueueTimeout = options.Value.EnqueueTimeout;
         channel = Channel.CreateBounded<AsyncJobEnvelope>(new BoundedChannelOptions(options.Value.QueueCapacity)
         {
@@ -18,6 +25,31 @@ internal sealed class InMemoryAsyncJobQueue : IAsyncJobQueue, IAsyncJobQueueRead
             SingleReader = false,
             SingleWriter = false
         });
+    }
+
+    public async ValueTask SubmitAsync(
+        string jobId,
+        object? payload,
+        AsyncExecutionMode executionMode,
+        string? accessToken,
+        CancellationToken cancellationToken = default)
+    {
+        var admitted = await statusStore.AdmitAsync(jobId, accessToken, cancellationToken);
+
+        if (!admitted)
+        {
+            return;
+        }
+
+        try
+        {
+            await EnqueueAsync(jobId, payload, executionMode, cancellationToken);
+        }
+        catch
+        {
+            await statusStore.DeleteAsync(jobId, CancellationToken.None);
+            throw;
+        }
     }
 
     public async ValueTask EnqueueAsync(

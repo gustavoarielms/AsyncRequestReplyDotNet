@@ -158,13 +158,11 @@ public sealed class AsyncRequestReplyTests
     }
 
     [Fact]
-    public async Task QueueRejection_ReturnsServiceUnavailableAndDeletesQueuedStatus()
+    public async Task SubmissionRejection_ReturnsServiceUnavailable()
     {
-        var store = new TrackingStatusStore();
         await using var app = await TestApp.StartAsync(configureServices: services =>
         {
-            services.AddSingleton<IAsyncJobQueue, RejectingQueue>();
-            services.AddSingleton<IAsyncStatusStore>(store);
+            services.AddSingleton<IAsyncJobSubmissionStore, RejectingSubmissionStore>();
         });
 
         var response = await app.Client.PostAsJsonAsync(
@@ -174,7 +172,6 @@ public sealed class AsyncRequestReplyTests
 
         Assert.Equal(HttpStatusCode.ServiceUnavailable, response.StatusCode);
         Assert.Equal("1", response.Headers.RetryAfter?.Delta?.TotalSeconds.ToString() ?? response.Headers.GetValues("Retry-After").Single());
-        Assert.Empty(store.Statuses);
     }
 
     [Fact]
@@ -200,34 +197,84 @@ public sealed class AsyncRequestReplyTests
     }
 
     [Fact]
-    public async Task StatusCapacity_EvictsOldestEntry()
+    public async Task StatusCapacity_EvictsOnlyOldestRetainedStatusAndCapabilityPair()
+    {
+        var services = new ServiceCollection();
+        services.AddLogging();
+        services.AddAsyncRequestReply(options => options.StatusCapacity = 2);
+        await using var provider = services.BuildServiceProvider();
+        var submissionStore = provider.GetRequiredService<IAsyncJobSubmissionStore>();
+        var statusStore = provider.GetRequiredService<IAsyncStatusStore>();
+        var tokenStore = provider.GetRequiredService<IAsyncStatusTokenStore>();
+
+        await submissionStore.SubmitAsync(
+            "terminal",
+            new { value = 1 },
+            AsyncExecutionMode.resolve_now,
+            "terminal-token",
+            TestContext.Current.CancellationToken);
+        await statusStore.SetAsync(
+            StatusResponseFactoryForTest("terminal", AsyncJobStatus.completed),
+            TestContext.Current.CancellationToken);
+        await statusStore.BeginRetentionAsync(
+            "terminal",
+            TestContext.Current.CancellationToken);
+        await tokenStore.BeginRetentionAsync(
+            "terminal",
+            TestContext.Current.CancellationToken);
+        await submissionStore.SubmitAsync(
+            "active",
+            new { value = 2 },
+            AsyncExecutionMode.resolve_now,
+            "active-token",
+            TestContext.Current.CancellationToken);
+        await submissionStore.SubmitAsync(
+            "new",
+            new { value = 3 },
+            AsyncExecutionMode.resolve_now,
+            "new-token",
+            TestContext.Current.CancellationToken);
+
+        Assert.Null(await statusStore.GetAsync(
+            "terminal",
+            TestContext.Current.CancellationToken));
+        Assert.False(await tokenStore.ValidateAsync(
+            "terminal",
+            "terminal-token",
+            TestContext.Current.CancellationToken));
+        Assert.NotNull(await statusStore.GetAsync(
+            "active",
+            TestContext.Current.CancellationToken));
+        Assert.True(await tokenStore.ValidateAsync(
+            "active",
+            "active-token",
+            TestContext.Current.CancellationToken));
+        Assert.NotNull(await statusStore.GetAsync(
+            "new",
+            TestContext.Current.CancellationToken));
+    }
+
+    [Fact]
+    public async Task StatusCapacity_WithOnlyActiveJobsRejectsSubmissionWithoutEviction()
     {
         await using var app = await TestApp.StartAsync(
             configureOptions: options => options.StatusCapacity = 1);
-        var now = DateTimeOffset.UtcNow;
+        var accepted = await PostOrderAsync(app.Client);
 
-        await app.StatusStore.SetAsync(new AsyncStatusResponse(
-            "old",
-            AsyncJobStatus.queued,
-            null,
-            null,
-            now,
-            now),
+        var rejected = await app.Client.PostAsJsonAsync(
+            "/orders",
+            new { data = new { name = "order-2" } },
             TestContext.Current.CancellationToken);
-        await app.StatusStore.SetAsync(new AsyncStatusResponse(
-            "new",
-            AsyncJobStatus.queued,
-            null,
-            null,
-            now.AddSeconds(1),
-            now.AddSeconds(1)),
+        var active = await app.Client.GetAsync(
+            accepted.Location,
             TestContext.Current.CancellationToken);
 
-        Assert.Null(await app.StatusStore.GetAsync(
-            "old",
-            TestContext.Current.CancellationToken));
+        Assert.True(
+            rejected.StatusCode == HttpStatusCode.ServiceUnavailable,
+            $"Expected 503 but received {(int)rejected.StatusCode}: {await rejected.Content.ReadAsStringAsync(TestContext.Current.CancellationToken)}");
+        Assert.Equal(HttpStatusCode.OK, active.StatusCode);
         Assert.NotNull(await app.StatusStore.GetAsync(
-            "new",
+            accepted.Id,
             TestContext.Current.CancellationToken));
     }
 
@@ -344,6 +391,87 @@ public sealed class AsyncRequestReplyTests
     }
 
     [Fact]
+    public async Task ExternalResolver_WaitingExternalThenCompletedContinuesResolving()
+    {
+        var observedStatuses = new List<AsyncStatusResponse>();
+        var resolver = new CapturingResolver(status =>
+        {
+            observedStatuses.Add(status);
+
+            return status.Status == AsyncJobStatus.waiting_external && observedStatuses.Count == 1
+                ? status with
+                {
+                    Result = new { attempt = 1 },
+                    UpdatedAt = DateTimeOffset.UtcNow
+                }
+                : status with
+                {
+                    Status = AsyncJobStatus.completed,
+                    Result = new { resolved = true },
+                    UpdatedAt = DateTimeOffset.UtcNow
+                };
+        });
+        await using var app = await TestApp.StartAsync(
+            configureServices: services => services.AddSingleton<IExternalStatusResolver>(resolver),
+            configureEndpoint: options => options.ExecutionMode = AsyncExecutionMode.wait_external);
+
+        var accepted = await PostOrderAsync(app.Client);
+        var status = await PollStatusAsync(app.Client, accepted.Location, AsyncJobStatus.completed);
+
+        Assert.Equal(AsyncJobStatus.completed, status.Status);
+        Assert.Equal(2, resolver.Calls);
+        Assert.Equal(2, observedStatuses.Count);
+        Assert.NotNull(observedStatuses[1].Result);
+    }
+
+    [Fact]
+    public async Task ExternalResolver_PermanentWaitingExternalFailsAfterConfiguredAttempts()
+    {
+        var resolver = new CapturingResolver(status => status with
+        {
+            Status = AsyncJobStatus.waiting_external,
+            UpdatedAt = DateTimeOffset.UtcNow
+        });
+        await using var app = await TestApp.StartAsync(
+            configureServices: services => services.AddSingleton<IExternalStatusResolver>(resolver),
+            configureOptions: options => options.ExternalResolutionMaxAttempts = 3,
+            configureEndpoint: options => options.ExecutionMode = AsyncExecutionMode.wait_external);
+
+        var accepted = await PostOrderAsync(app.Client);
+        var status = await PollStatusAsync(app.Client, accepted.Location, AsyncJobStatus.failed);
+
+        Assert.Equal(AsyncJobStatus.failed, status.Status);
+        Assert.Equal(3, resolver.Calls);
+    }
+
+    [Fact]
+    public async Task ExternalResolver_InvalidStatusesConsumeAttemptsAndFail()
+    {
+        var invalidStatuses = new[]
+        {
+            AsyncJobStatus.queued,
+            AsyncJobStatus.processing,
+            AsyncJobStatus.not_found
+        };
+        var resolverCallIndex = 0;
+        var resolver = new CapturingResolver(status => status with
+        {
+            Status = invalidStatuses[Math.Min(invalidStatuses.Length - 1, resolverCallIndex++)],
+            UpdatedAt = DateTimeOffset.UtcNow
+        });
+        await using var app = await TestApp.StartAsync(
+            configureServices: services => services.AddSingleton<IExternalStatusResolver>(resolver),
+            configureOptions: options => options.ExternalResolutionMaxAttempts = 3,
+            configureEndpoint: options => options.ExecutionMode = AsyncExecutionMode.wait_external);
+
+        var accepted = await PostOrderAsync(app.Client);
+        var status = await PollStatusAsync(app.Client, accepted.Location, AsyncJobStatus.failed);
+
+        Assert.Equal(AsyncJobStatus.failed, status.Status);
+        Assert.Equal(3, resolver.Calls);
+    }
+
+    [Fact]
     public void InvalidOptions_AreRejected()
     {
         var services = new ServiceCollection();
@@ -396,6 +524,25 @@ public sealed class AsyncRequestReplyTests
     }
 
     [Fact]
+    public void RedisKeysWithoutMatchingHashTag_AreRejected()
+    {
+        var services = new ServiceCollection();
+        services.AddLogging();
+        services.AddAsyncRequestReply();
+        services.AddAsyncRequestReplyRedis(options =>
+        {
+            options.StreamKey = "{jobs}:stream";
+            options.StatusKeyPrefix = "{statuses}:status:";
+        });
+        using var provider = services.BuildServiceProvider();
+
+        var exception = Assert.Throws<OptionsValidationException>(
+            () => provider.GetRequiredService<IOptions<RedisAsyncRequestReplyOptions>>().Value);
+
+        Assert.Contains("same non-empty hash tag", exception.Message);
+    }
+
+    [Fact]
     [Trait("Category", "RedisIntegration")]
     public async Task RedisTransport_EnforcesCapacityRecoversPendingDeliveryAndExpiresState()
     {
@@ -407,8 +554,8 @@ public sealed class AsyncRequestReplyTests
         }
 
         var suffix = Guid.NewGuid().ToString("N");
-        var streamKey = $"async-request-reply:test:{suffix}:jobs";
-        var statusPrefix = $"async-request-reply:test:{suffix}:status:";
+        var streamKey = $"async-request-reply:{{{suffix}}}:jobs";
+        var statusPrefix = $"async-request-reply:{{{suffix}}}:status:";
         var services = new ServiceCollection();
         services.AddLogging();
         services.AddAsyncRequestReply(options =>
@@ -526,6 +673,173 @@ public sealed class AsyncRequestReplyTests
     }
 
     [Fact]
+    [Trait("Category", "RedisIntegration")]
+    public async Task RedisSubmission_IsAtomicCapacitySafeAndIdempotentByJobId()
+    {
+        var configuration = Environment.GetEnvironmentVariable("ASYNC_REQUEST_REPLY_REDIS_CONNECTION");
+
+        if (string.IsNullOrWhiteSpace(configuration))
+        {
+            Assert.Skip("Set ASYNC_REQUEST_REPLY_REDIS_CONNECTION to run the Redis integration test.");
+        }
+
+        var suffix = Guid.NewGuid().ToString("N");
+        var streamKey = $"async-request-reply:{{{suffix}}}:jobs";
+        var statusPrefix = $"async-request-reply:{{{suffix}}}:status:";
+        var services = new ServiceCollection();
+        services.AddLogging();
+        services.AddAsyncRequestReply();
+        services.AddAsyncRequestReplyRedis(options =>
+        {
+            options.Configuration = configuration;
+            options.StreamKey = streamKey;
+            options.ConsumerGroup = $"group-{suffix}";
+            options.StatusKeyPrefix = statusPrefix;
+            options.MaxQueueLength = 1;
+        });
+        await using var provider = services.BuildServiceProvider();
+        var submissionStore = provider.GetRequiredService<IAsyncJobSubmissionStore>();
+        var statusStore = provider.GetRequiredService<IAsyncStatusStore>();
+        var tokenStore = provider.GetRequiredService<IAsyncStatusTokenStore>();
+        var connection = provider.GetRequiredService<StackExchange.Redis.IConnectionMultiplexer>();
+        var database = connection.GetDatabase();
+
+        try
+        {
+            await submissionStore.SubmitAsync(
+                "job-1",
+                new { value = 1 },
+                AsyncExecutionMode.resolve_now,
+                "secret-1",
+                TestContext.Current.CancellationToken);
+            await submissionStore.SubmitAsync(
+                "job-1",
+                new { value = 1 },
+                AsyncExecutionMode.resolve_now,
+                "secret-1",
+                TestContext.Current.CancellationToken);
+
+            Assert.Equal(1, await database.StreamLengthAsync(streamKey));
+            Assert.NotNull(await statusStore.GetAsync(
+                "job-1",
+                TestContext.Current.CancellationToken));
+            Assert.True(await tokenStore.ValidateAsync(
+                "job-1",
+                "secret-1",
+                TestContext.Current.CancellationToken));
+
+            await Assert.ThrowsAsync<AsyncQueueUnavailableException>(
+                () => submissionStore.SubmitAsync(
+                    "job-2",
+                    new { value = 2 },
+                    AsyncExecutionMode.resolve_now,
+                    "secret-2",
+                    TestContext.Current.CancellationToken).AsTask());
+
+            Assert.Null(await statusStore.GetAsync(
+                "job-2",
+                TestContext.Current.CancellationToken));
+            Assert.False(await tokenStore.ValidateAsync(
+                "job-2",
+                "secret-2",
+                TestContext.Current.CancellationToken));
+        }
+        finally
+        {
+            await database.KeyDeleteAsync(
+                [
+                    streamKey,
+                    $"{statusPrefix}job-1",
+                    $"{statusPrefix}access:job-1",
+                    $"{statusPrefix}job-2",
+                    $"{statusPrefix}access:job-2"
+                ]);
+        }
+    }
+
+    [Fact]
+    [Trait("Category", "RedisIntegration")]
+    public async Task RedisPendingSweep_UsesAutoClaimCursorToRecoverEleventhEntry()
+    {
+        var configuration = Environment.GetEnvironmentVariable("ASYNC_REQUEST_REPLY_REDIS_CONNECTION");
+
+        if (string.IsNullOrWhiteSpace(configuration))
+        {
+            Assert.Skip("Set ASYNC_REQUEST_REPLY_REDIS_CONNECTION to run the Redis integration test.");
+        }
+
+        var suffix = Guid.NewGuid().ToString("N");
+        var streamKey = $"async-request-reply:{{{suffix}}}:jobs";
+        var statusPrefix = $"async-request-reply:{{{suffix}}}:status:";
+        var group = $"group-{suffix}";
+        var services = new ServiceCollection();
+        services.AddLogging();
+        services.AddAsyncRequestReply(options =>
+        {
+            options.DeliveryLeaseRenewalInterval = TimeSpan.FromMilliseconds(100);
+        });
+        services.AddAsyncRequestReplyRedis(options =>
+        {
+            options.Configuration = configuration;
+            options.StreamKey = streamKey;
+            options.ConsumerGroup = group;
+            options.ConsumerName = $"recovering-{suffix}";
+            options.StatusKeyPrefix = statusPrefix;
+            options.MaxQueueLength = 20;
+            options.ClaimIdleTime = TimeSpan.FromSeconds(1);
+        });
+        await using var provider = services.BuildServiceProvider();
+        var queue = provider.GetRequiredService<IAsyncJobQueue>();
+        var reader = provider.GetRequiredService<IAsyncJobQueueReader>();
+        var connection = provider.GetRequiredService<StackExchange.Redis.IConnectionMultiplexer>();
+        var database = connection.GetDatabase();
+
+        try
+        {
+            for (var index = 1; index <= 11; index++)
+            {
+                await queue.EnqueueAsync(
+                    $"job-{index}",
+                    new { value = index },
+                    AsyncExecutionMode.resolve_now,
+                    TestContext.Current.CancellationToken);
+            }
+
+            await database.StreamCreateConsumerGroupAsync(
+                streamKey,
+                group,
+                "0-0",
+                createStream: false);
+            var pending = await database.StreamReadGroupAsync(
+                streamKey,
+                group,
+                $"original-{suffix}",
+                ">",
+                count: 11);
+            Assert.Equal(11, pending.Length);
+
+            await Task.Delay(
+                TimeSpan.FromMilliseconds(1_100),
+                TestContext.Current.CancellationToken);
+            await database.StreamClaimIdsOnlyAsync(
+                streamKey,
+                group,
+                $"original-{suffix}",
+                0,
+                pending.Take(10).Select(entry => entry.Id).ToArray());
+
+            var recovered = await ReadOneAsync(reader);
+
+            Assert.Equal(pending[10].Id.ToString(), recovered.DeliveryId);
+            Assert.Equal("job-11", recovered.Job.Id);
+        }
+        finally
+        {
+            await database.KeyDeleteAsync(streamKey);
+        }
+    }
+
+    [Fact]
     public async Task PayloadPath_ExtractsConfiguredBodyProperty()
     {
         var processor = new CapturingProcessor(payload => payload);
@@ -550,6 +864,11 @@ public sealed class AsyncRequestReplyTests
         {
             services.AddSingleton<IAsyncJobQueue>(queue);
             services.AddSingleton<IAsyncJobQueueReader>(queue);
+            services.AddSingleton<IAsyncJobSubmissionStore>(provider =>
+                new TestSubmissionStore(
+                    queue,
+                    provider.GetRequiredService<IAsyncStatusStore>(),
+                    provider.GetRequiredService<IAsyncStatusTokenStore>()));
         });
 
         var accepted = await PostOrderAsync(app.Client);
@@ -568,6 +887,11 @@ public sealed class AsyncRequestReplyTests
         {
             services.AddSingleton<IAsyncJobQueue>(queue);
             services.AddSingleton<IAsyncJobQueueReader>(queue);
+            services.AddSingleton<IAsyncJobSubmissionStore>(provider =>
+                new TestSubmissionStore(
+                    queue,
+                    provider.GetRequiredService<IAsyncStatusStore>(),
+                    provider.GetRequiredService<IAsyncStatusTokenStore>()));
         });
 
         var accepted = await PostOrderAsync(app.Client);
@@ -594,6 +918,11 @@ public sealed class AsyncRequestReplyTests
             {
                 services.AddSingleton<IAsyncJobQueue>(queue);
                 services.AddSingleton<IAsyncJobQueueReader>(queue);
+                services.AddSingleton<IAsyncJobSubmissionStore>(provider =>
+                    new TestSubmissionStore(
+                        queue,
+                        provider.GetRequiredService<IAsyncStatusStore>(),
+                        provider.GetRequiredService<IAsyncStatusTokenStore>()));
             },
             options => options.WorkerRecoveryInterval = TimeSpan.FromMilliseconds(10));
 
@@ -674,6 +1003,7 @@ public sealed class AsyncRequestReplyTests
         Assert.Contains(services, descriptor => descriptor.ServiceType == redisStoreType);
         Assert.Single(services, descriptor => descriptor.ServiceType == typeof(IAsyncJobQueue));
         Assert.Single(services, descriptor => descriptor.ServiceType == typeof(IAsyncJobQueueReader));
+        Assert.Single(services, descriptor => descriptor.ServiceType == typeof(IAsyncJobSubmissionStore));
         Assert.Single(services, descriptor => descriptor.ServiceType == typeof(IAsyncStatusStore));
         Assert.Single(services, descriptor => descriptor.ServiceType == typeof(IAsyncStatusTokenStore));
     }
@@ -686,6 +1016,14 @@ public sealed class AsyncRequestReplyTests
         var accepted = await response.Content.ReadFromJsonAsync<AsyncAcceptedResponse>(JsonOptions);
         Assert.NotNull(accepted);
         return accepted!;
+    }
+
+    private static AsyncStatusResponse StatusResponseFactoryForTest(
+        string jobId,
+        AsyncJobStatus status)
+    {
+        var now = DateTimeOffset.UtcNow;
+        return new AsyncStatusResponse(jobId, status, null, null, now, now);
     }
 
     private static async Task<AsyncStatusResponse> PollStatusAsync(HttpClient client, string location, AsyncJobStatus expectedStatus)
@@ -942,51 +1280,50 @@ public sealed class AsyncRequestReplyTests
         }
     }
 
-    private sealed class RejectingQueue : IAsyncJobQueue
+    private sealed class TestSubmissionStore(
+        IAsyncJobQueue queue,
+        IAsyncStatusStore statusStore,
+        IAsyncStatusTokenStore tokenStore) : IAsyncJobSubmissionStore
     {
-        public ValueTask EnqueueAsync(
+        public async ValueTask SubmitAsync(
             string jobId,
             object? payload,
             AsyncExecutionMode executionMode,
+            string? accessToken,
             CancellationToken cancellationToken = default)
         {
-            throw new AsyncQueueUnavailableException("full");
+            await statusStore.SetAsync(
+                StatusResponseFactoryForTest(jobId, AsyncJobStatus.queued),
+                cancellationToken);
+
+            if (accessToken is not null)
+            {
+                await tokenStore.SetAsync(jobId, accessToken, cancellationToken);
+            }
+
+            try
+            {
+                await queue.EnqueueAsync(jobId, payload, executionMode, cancellationToken);
+            }
+            catch
+            {
+                await statusStore.DeleteAsync(jobId, CancellationToken.None);
+                await tokenStore.DeleteAsync(jobId, CancellationToken.None);
+                throw;
+            }
         }
     }
 
-    private sealed class TrackingStatusStore : IAsyncStatusStore
+    private sealed class RejectingSubmissionStore : IAsyncJobSubmissionStore
     {
-        public Dictionary<string, AsyncStatusResponse> Statuses { get; } = new();
-
-        public Task<AsyncStatusResponse?> GetAsync(
+        public ValueTask SubmitAsync(
             string jobId,
+            object? payload,
+            AsyncExecutionMode executionMode,
+            string? accessToken,
             CancellationToken cancellationToken = default)
         {
-            Statuses.TryGetValue(jobId, out var status);
-            return Task.FromResult(status);
-        }
-
-        public Task SetAsync(
-            AsyncStatusResponse status,
-            CancellationToken cancellationToken = default)
-        {
-            Statuses[status.Id] = status;
-            return Task.CompletedTask;
-        }
-
-        public Task DeleteAsync(
-            string jobId,
-            CancellationToken cancellationToken = default)
-        {
-            Statuses.Remove(jobId);
-            return Task.CompletedTask;
-        }
-
-        public Task BeginRetentionAsync(
-            string jobId,
-            CancellationToken cancellationToken = default)
-        {
-            return Task.CompletedTask;
+            throw new AsyncQueueUnavailableException("full");
         }
     }
 

@@ -171,14 +171,14 @@ internal sealed class AsyncJobBackgroundService(
         DateTimeOffset createdAt,
         CancellationToken cancellationToken)
     {
-        var waiting = new AsyncStatusResponse(
+        var currentStatus = new AsyncStatusResponse(
             job.Id,
             AsyncJobStatus.waiting_external,
             null,
             null,
             createdAt,
             SystemClock.UtcNow());
-        await SetStatusAsync(waiting, cancellationToken);
+        await SetStatusAsync(currentStatus, cancellationToken);
 
         var resolver = externalResolvers.FirstOrDefault();
 
@@ -195,7 +195,7 @@ internal sealed class AsyncJobBackgroundService(
 
             try
             {
-                var resolved = await resolver.ResolveAsync(job.Id, waiting, timeout.Token);
+                var resolved = await resolver.ResolveAsync(job.Id, currentStatus, timeout.Token);
 
                 if (resolved is not null)
                 {
@@ -205,8 +205,25 @@ internal sealed class AsyncJobBackgroundService(
                             "The external status resolver returned a different job identifier.");
                     }
 
-                    await SetStatusAsync(resolved, cancellationToken);
-                    return true;
+                    switch (resolved.Status)
+                    {
+                        case AsyncJobStatus.completed:
+                        case AsyncJobStatus.failed:
+                            await SetStatusAsync(resolved, cancellationToken);
+                            return true;
+                        case AsyncJobStatus.waiting_external:
+                            await SetStatusAsync(resolved, cancellationToken);
+                            currentStatus = resolved;
+                            break;
+                        case AsyncJobStatus.queued:
+                        case AsyncJobStatus.processing:
+                        case AsyncJobStatus.not_found:
+                            throw new InvalidOperationException(
+                                $"The external status resolver returned invalid status {resolved.Status}.");
+                        default:
+                            throw new InvalidOperationException(
+                                $"The external status resolver returned unknown status {resolved.Status}.");
+                    }
                 }
             }
             catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)

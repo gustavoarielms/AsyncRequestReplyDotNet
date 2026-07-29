@@ -29,6 +29,17 @@ internal sealed class RedisAsyncRequestReplyOptionsValidator(
             return ValidateOptionsResult.Fail("Redis StatusKeyPrefix is required.");
         }
 
+        var streamHashTag = GetHashTag(options.StreamKey);
+        var statusHashTag = GetHashTag(options.StatusKeyPrefix);
+
+        if (streamHashTag is null
+            || statusHashTag is null
+            || !string.Equals(streamHashTag, statusHashTag, StringComparison.Ordinal))
+        {
+            return ValidateOptionsResult.Fail(
+                "Redis StreamKey and StatusKeyPrefix must contain the same non-empty hash tag.");
+        }
+
         if (options.QueuePollInterval <= TimeSpan.Zero)
         {
             return ValidateOptionsResult.Fail("Redis QueuePollInterval must be greater than zero.");
@@ -73,6 +84,22 @@ internal sealed class RedisAsyncRequestReplyOptionsValidator(
         }
 
         return ValidateOptionsResult.Success;
+    }
+
+    private static string? GetHashTag(string key)
+    {
+        var start = key.IndexOf('{');
+
+        if (start < 0)
+        {
+            return null;
+        }
+
+        var end = key.IndexOf('}', start + 1);
+
+        return end > start + 1
+            ? key[(start + 1)..end]
+            : null;
     }
 
     private static bool IsLoopback(EndPoint endpoint)

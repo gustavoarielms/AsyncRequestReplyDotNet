@@ -33,11 +33,13 @@ public static class RedisAsyncRequestReplyServiceCollectionExtensions
 
         services.RemoveAll<IAsyncJobQueue>();
         services.RemoveAll<IAsyncJobQueueReader>();
+        services.RemoveAll<IAsyncJobSubmissionStore>();
         services.RemoveAll<IAsyncStatusStore>();
         services.RemoveAll<IAsyncStatusTokenStore>();
 
         services.AddSingleton<IAsyncJobQueue>(sp => sp.GetRequiredService<RedisAsyncRequestReplyStore>());
         services.AddSingleton<IAsyncJobQueueReader>(sp => sp.GetRequiredService<RedisAsyncRequestReplyStore>());
+        services.AddSingleton<IAsyncJobSubmissionStore>(sp => sp.GetRequiredService<RedisAsyncRequestReplyStore>());
         services.AddSingleton<IAsyncStatusStore>(sp => sp.GetRequiredService<RedisAsyncRequestReplyStore>());
         services.AddSingleton<IAsyncStatusTokenStore>(sp => sp.GetRequiredService<RedisAsyncRequestReplyStore>());
 

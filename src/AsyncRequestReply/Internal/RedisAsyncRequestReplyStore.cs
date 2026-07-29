@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using System.Text.Json;
 using System.Text.Json.Serialization;
@@ -10,9 +11,11 @@ namespace AsyncRequestReply.Internal;
 internal sealed class RedisAsyncRequestReplyStore(
     IConnectionMultiplexer connection,
     IOptions<RedisAsyncRequestReplyOptions> redisOptions,
+    IOptions<AsyncRequestReplyOptions> requestReplyOptions,
     ILogger<RedisAsyncRequestReplyStore> logger) :
     IAsyncJobQueue,
     IAsyncJobQueueReader,
+    IAsyncJobSubmissionStore,
     IAsyncStatusStore,
     IAsyncStatusTokenStore
 {
@@ -22,6 +25,20 @@ internal sealed class RedisAsyncRequestReplyStore(
             return nil
         end
         return redis.call('XADD', KEYS[1], '*', 'job', ARGV[2])
+        """;
+    private const string SubmitScript = """
+        if redis.call('EXISTS', KEYS[2]) == 1 then
+            return 1
+        end
+        if redis.call('XLEN', KEYS[1]) >= tonumber(ARGV[1]) then
+            return 0
+        end
+        redis.call('XADD', KEYS[1], '*', 'job', ARGV[2])
+        redis.call('SET', KEYS[2], ARGV[3])
+        if ARGV[4] == '1' then
+            redis.call('SET', KEYS[3], ARGV[5])
+        end
+        return 1
         """;
     private const string CompleteScript = """
         local pending = redis.call('XPENDING', KEYS[1], ARGV[1], ARGV[3], ARGV[3], 1)
@@ -47,11 +64,81 @@ internal sealed class RedisAsyncRequestReplyStore(
     };
 
     private readonly RedisAsyncRequestReplyOptions options = redisOptions.Value;
+    private readonly TimeSpan enqueueTimeout = requestReplyOptions.Value.EnqueueTimeout;
     private readonly SemaphoreSlim groupLock = new(1, 1);
     private readonly string consumerName = string.IsNullOrWhiteSpace(redisOptions.Value.ConsumerName)
         ? $"{Environment.MachineName}-{Environment.ProcessId}-{Guid.NewGuid():N}"
         : redisOptions.Value.ConsumerName;
     private bool groupCreated;
+    private RedisValue autoClaimCursor = "0-0";
+
+    public async ValueTask SubmitAsync(
+        string jobId,
+        object? payload,
+        AsyncExecutionMode executionMode,
+        string? accessToken,
+        CancellationToken cancellationToken = default)
+    {
+        var job = new AsyncJobEnvelope(jobId, payload, executionMode);
+        var jobJson = JsonSerializer.Serialize(job, JsonOptions);
+        var statusJson = JsonSerializer.Serialize(StatusResponseFactory.Queued(jobId), JsonOptions);
+        var tokenHash = accessToken is null
+            ? Array.Empty<byte>()
+            : StatusAccessToken.Hash(accessToken);
+        var elapsed = Stopwatch.StartNew();
+        Exception? lastTransientError = null;
+
+        while (true)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            if (lastTransientError is not null && elapsed.Elapsed >= enqueueTimeout)
+            {
+                throw new AsyncQueueUnavailableException(
+                    "The Redis job stream is temporarily unavailable.",
+                    lastTransientError);
+            }
+
+            try
+            {
+                var result = await Database.ScriptEvaluateAsync(
+                    SubmitScript,
+                    [options.StreamKey, StatusKey(jobId), AccessTokenKey(jobId)],
+                    [
+                        options.MaxQueueLength,
+                        jobJson,
+                        statusJson,
+                        accessToken is null ? 0 : 1,
+                        tokenHash
+                    ]);
+
+                if ((long)result == 0)
+                {
+                    throw new AsyncQueueUnavailableException("The Redis job stream is full.");
+                }
+
+                return;
+            }
+            catch (Exception ex) when (IsTransient(ex))
+            {
+                lastTransientError = ex;
+                var remaining = enqueueTimeout - elapsed.Elapsed;
+
+                if (remaining <= TimeSpan.Zero)
+                {
+                    throw new AsyncQueueUnavailableException(
+                        "The Redis job stream is temporarily unavailable.",
+                        ex);
+                }
+
+                await Task.Delay(
+                    remaining < TimeSpan.FromMilliseconds(100)
+                        ? remaining
+                        : TimeSpan.FromMilliseconds(100),
+                    cancellationToken);
+            }
+        }
+    }
 
     public async ValueTask EnqueueAsync(
         string jobId,
@@ -61,10 +148,22 @@ internal sealed class RedisAsyncRequestReplyStore(
     {
         var job = new AsyncJobEnvelope(jobId, payload, executionMode);
         var json = JsonSerializer.Serialize(job, JsonOptions);
-        var result = await Database.ScriptEvaluateAsync(
-            EnqueueScript,
-            [options.StreamKey],
-            [options.MaxQueueLength, json]);
+        RedisResult result;
+
+        try
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            result = await Database.ScriptEvaluateAsync(
+                EnqueueScript,
+                [options.StreamKey],
+                [options.MaxQueueLength, json]);
+        }
+        catch (Exception ex) when (IsTransient(ex))
+        {
+            throw new AsyncQueueUnavailableException(
+                "The Redis job stream is temporarily unavailable.",
+                ex);
+        }
 
         if (result.IsNull)
         {
@@ -241,17 +340,26 @@ internal sealed class RedisAsyncRequestReplyStore(
 
     private async Task<StreamEntry?> ReadNextEntryAsync()
     {
-        var claimed = await Database.StreamAutoClaimAsync(
-            options.StreamKey,
-            options.ConsumerGroup,
-            consumerName,
-            (long)options.ClaimIdleTime.TotalMilliseconds,
-            "0-0",
-            count: 1);
-
-        if (claimed.ClaimedEntries.Length > 0)
+        while (true)
         {
-            return claimed.ClaimedEntries[0];
+            var claimed = await Database.StreamAutoClaimAsync(
+                options.StreamKey,
+                options.ConsumerGroup,
+                consumerName,
+                (long)options.ClaimIdleTime.TotalMilliseconds,
+                autoClaimCursor,
+                count: 1);
+            autoClaimCursor = claimed.NextStartId;
+
+            if (claimed.ClaimedEntries.Length > 0)
+            {
+                return claimed.ClaimedEntries[0];
+            }
+
+            if (autoClaimCursor == "0-0")
+            {
+                break;
+            }
         }
 
         var entries = await Database.StreamReadGroupAsync(

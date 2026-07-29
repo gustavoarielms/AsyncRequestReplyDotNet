@@ -59,30 +59,24 @@ public static class AsyncRequestReplyRouteHandlerBuilderExtensions
             }
 
             var jobId = Guid.NewGuid().ToString("N");
-            var statusStore = httpContext.RequestServices.GetRequiredService<IAsyncStatusStore>();
-            var tokenStore = httpContext.RequestServices.GetRequiredService<IAsyncStatusTokenStore>();
-            var queue = httpContext.RequestServices.GetRequiredService<IAsyncJobQueue>();
+            var submissionStore = httpContext.RequestServices.GetRequiredService<IAsyncJobSubmissionStore>();
             var requestReplyOptions = httpContext.RequestServices.GetRequiredService<IOptions<AsyncRequestReplyOptions>>();
             var accessToken = requestReplyOptions.Value.AllowCapabilityStatusAccess
                 ? StatusAccessToken.Create()
                 : null;
             var location = StatusLocationBuilder.Build(requestReplyOptions, jobId, accessToken);
 
-            await statusStore.SetAsync(StatusResponseFactory.Queued(jobId), cancellationToken);
-
-            if (accessToken is not null)
-            {
-                await tokenStore.SetAsync(jobId, accessToken, cancellationToken);
-            }
-
             try
             {
-                await queue.EnqueueAsync(jobId, payload, endpointOptions.ExecutionMode, cancellationToken);
+                await submissionStore.SubmitAsync(
+                    jobId,
+                    payload,
+                    endpointOptions.ExecutionMode,
+                    accessToken,
+                    cancellationToken);
             }
             catch (AsyncQueueUnavailableException)
             {
-                await statusStore.DeleteAsync(jobId, CancellationToken.None);
-                await tokenStore.DeleteAsync(jobId, CancellationToken.None);
                 httpContext.Response.Headers.RetryAfter = "1";
 
                 return Results.Json(

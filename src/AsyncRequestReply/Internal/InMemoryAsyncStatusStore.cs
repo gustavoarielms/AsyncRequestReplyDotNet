@@ -1,13 +1,16 @@
-using System.Collections.Concurrent;
+using System.Security.Cryptography;
 using Microsoft.Extensions.Options;
 
 namespace AsyncRequestReply.Internal;
 
-internal sealed class InMemoryAsyncStatusStore : IAsyncStatusStore
+internal sealed class InMemoryAsyncStatusStore : IAsyncStatusStore, IAsyncStatusTokenStore
 {
-    private sealed record Entry(AsyncStatusResponse Status, DateTimeOffset? ExpiresAt);
+    private sealed record Entry(
+        AsyncStatusResponse? Status,
+        byte[]? TokenHash,
+        DateTimeOffset? ExpiresAt);
 
-    private readonly ConcurrentDictionary<string, Entry> statuses = new();
+    private readonly Dictionary<string, Entry> entries = new();
     private readonly object writeLock = new();
     private readonly AsyncRequestReplyOptions options;
 
@@ -18,38 +21,37 @@ internal sealed class InMemoryAsyncStatusStore : IAsyncStatusStore
 
     public Task<AsyncStatusResponse?> GetAsync(string jobId, CancellationToken cancellationToken = default)
     {
-        if (!statuses.TryGetValue(jobId, out var entry))
-        {
-            return Task.FromResult<AsyncStatusResponse?>(null);
-        }
+        cancellationToken.ThrowIfCancellationRequested();
 
-        if (entry.ExpiresAt is { } expiresAt && expiresAt <= DateTimeOffset.UtcNow)
+        lock (writeLock)
         {
-            statuses.TryRemove(jobId, out _);
-            return Task.FromResult<AsyncStatusResponse?>(null);
-        }
+            RemoveExpired(DateTimeOffset.UtcNow);
 
-        return Task.FromResult<AsyncStatusResponse?>(entry.Status);
+            return Task.FromResult(
+                entries.TryGetValue(jobId, out var entry)
+                    ? entry.Status
+                    : null);
+        }
     }
 
     public Task SetAsync(AsyncStatusResponse status, CancellationToken cancellationToken = default)
     {
+        cancellationToken.ThrowIfCancellationRequested();
+
         lock (writeLock)
         {
             var now = DateTimeOffset.UtcNow;
             RemoveExpired(now);
 
-            if (!statuses.ContainsKey(status.Id) && statuses.Count >= options.StatusCapacity)
+            if (entries.TryGetValue(status.Id, out var entry))
             {
-                var oldest = statuses.MinBy(pair => pair.Value.Status.UpdatedAt);
-
-                if (!oldest.Equals(default(KeyValuePair<string, Entry>)))
-                {
-                    statuses.TryRemove(oldest.Key, out _);
-                }
+                entries[status.Id] = entry with { Status = status };
             }
-
-            statuses[status.Id] = new Entry(status, null);
+            else
+            {
+                EnsureCapacity();
+                entries[status.Id] = new Entry(status, null, null);
+            }
         }
 
         return Task.CompletedTask;
@@ -59,11 +61,13 @@ internal sealed class InMemoryAsyncStatusStore : IAsyncStatusStore
         string jobId,
         CancellationToken cancellationToken = default)
     {
+        cancellationToken.ThrowIfCancellationRequested();
+
         lock (writeLock)
         {
-            if (statuses.TryGetValue(jobId, out var entry))
+            if (entries.TryGetValue(jobId, out var entry) && entry.ExpiresAt is null)
             {
-                statuses[jobId] = entry with
+                entries[jobId] = entry with
                 {
                     ExpiresAt = DateTimeOffset.UtcNow.Add(options.StatusTimeToLive)
                 };
@@ -75,17 +79,132 @@ internal sealed class InMemoryAsyncStatusStore : IAsyncStatusStore
 
     public Task DeleteAsync(string jobId, CancellationToken cancellationToken = default)
     {
-        statuses.TryRemove(jobId, out _);
+        cancellationToken.ThrowIfCancellationRequested();
+
+        lock (writeLock)
+        {
+            entries.Remove(jobId);
+        }
+
         return Task.CompletedTask;
+    }
+
+    internal Task<bool> AdmitAsync(
+        string jobId,
+        string? accessToken,
+        CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+
+        lock (writeLock)
+        {
+            var now = DateTimeOffset.UtcNow;
+            RemoveExpired(now);
+
+            if (entries.ContainsKey(jobId))
+            {
+                return Task.FromResult(false);
+            }
+
+            EnsureCapacity();
+            entries[jobId] = new Entry(
+                StatusResponseFactory.Queued(jobId),
+                accessToken is null ? null : StatusAccessToken.Hash(accessToken),
+                null);
+
+            return Task.FromResult(true);
+        }
+    }
+
+    Task IAsyncStatusTokenStore.SetAsync(
+        string jobId,
+        string accessToken,
+        CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+
+        lock (writeLock)
+        {
+            var now = DateTimeOffset.UtcNow;
+            RemoveExpired(now);
+            var tokenHash = StatusAccessToken.Hash(accessToken);
+
+            if (entries.TryGetValue(jobId, out var entry))
+            {
+                entries[jobId] = entry with { TokenHash = tokenHash };
+            }
+            else
+            {
+                EnsureCapacity();
+                entries[jobId] = new Entry(null, tokenHash, null);
+            }
+        }
+
+        return Task.CompletedTask;
+    }
+
+    Task<bool> IAsyncStatusTokenStore.ValidateAsync(
+        string jobId,
+        string accessToken,
+        CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+
+        lock (writeLock)
+        {
+            RemoveExpired(DateTimeOffset.UtcNow);
+
+            return Task.FromResult(
+                entries.TryGetValue(jobId, out var entry)
+                && entry.TokenHash is not null
+                && CryptographicOperations.FixedTimeEquals(
+                    entry.TokenHash,
+                    StatusAccessToken.Hash(accessToken)));
+        }
+    }
+
+    Task IAsyncStatusTokenStore.DeleteAsync(
+        string jobId,
+        CancellationToken cancellationToken)
+    {
+        return DeleteAsync(jobId, cancellationToken);
+    }
+
+    Task IAsyncStatusTokenStore.BeginRetentionAsync(
+        string jobId,
+        CancellationToken cancellationToken)
+    {
+        return BeginRetentionAsync(jobId, cancellationToken);
+    }
+
+    private void EnsureCapacity()
+    {
+        if (entries.Count < options.StatusCapacity)
+        {
+            return;
+        }
+
+        var oldestRetained = entries
+            .Where(pair => pair.Value.ExpiresAt is not null)
+            .OrderBy(pair => pair.Value.ExpiresAt)
+            .FirstOrDefault();
+
+        if (oldestRetained.Equals(default(KeyValuePair<string, Entry>)))
+        {
+            throw new AsyncQueueUnavailableException(
+                "The in-memory status store is full of active jobs.");
+        }
+
+        entries.Remove(oldestRetained.Key);
     }
 
     private void RemoveExpired(DateTimeOffset now)
     {
-        foreach (var pair in statuses)
+        foreach (var pair in entries.ToArray())
         {
             if (pair.Value.ExpiresAt is { } expiresAt && expiresAt <= now)
             {
-                statuses.TryRemove(pair.Key, out _);
+                entries.Remove(pair.Key);
             }
         }
     }

@@ -6,13 +6,13 @@ public sealed class RedisAsyncRequestReplyOptions
 
     public int Database { get; set; } = -1;
 
-    public string StreamKey { get; set; } = "async-request-reply:jobs";
+    public string StreamKey { get; set; } = "{async-request-reply}:jobs";
 
     public string ConsumerGroup { get; set; } = "async-request-reply";
 
     public string? ConsumerName { get; set; }
 
-    public string StatusKeyPrefix { get; set; } = "async-request-reply:status:";
+    public string StatusKeyPrefix { get; set; } = "{async-request-reply}:status:";
 
     public TimeSpan QueuePollInterval { get; set; } = TimeSpan.FromMilliseconds(250);
 
