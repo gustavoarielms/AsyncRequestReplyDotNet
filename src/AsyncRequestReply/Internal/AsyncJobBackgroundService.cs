@@ -17,69 +17,87 @@ internal sealed class AsyncJobBackgroundService(
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
+        while (!stoppingToken.IsCancellationRequested)
+        {
+            try
+            {
+                await RunQueueAsync(stoppingToken);
+                return;
+            }
+            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+            {
+                return;
+            }
+            catch (AsyncQueueUnavailableException ex)
+            {
+                logger.LogWarning(
+                    ex,
+                    "Async request-reply queue reader is unavailable. Retrying in {RetryInterval}.",
+                    options.WorkerRecoveryInterval);
+                await Task.Delay(options.WorkerRecoveryInterval, stoppingToken);
+            }
+        }
+    }
+
+    private async Task RunQueueAsync(CancellationToken stoppingToken)
+    {
         var parallelOptions = new ParallelOptions
         {
             CancellationToken = stoppingToken,
             MaxDegreeOfParallelism = options.WorkerConcurrency
         };
 
-        try
-        {
-            await Parallel.ForEachAsync(
-                queue.DequeueAllAsync(stoppingToken),
-                parallelOptions,
-                async (delivery, cancellationToken) =>
+        await Parallel.ForEachAsync(
+            queue.DequeueAllAsync(stoppingToken),
+            parallelOptions,
+            async (delivery, cancellationToken) =>
+            {
+                using var deliveryCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                var heartbeat = RenewLeaseAsync(delivery, deliveryCancellation);
+
+                try
                 {
-                    using var deliveryCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-                    var heartbeat = RenewLeaseAsync(delivery, deliveryCancellation);
+                    var completed = await ProcessDeliveryAsync(delivery, deliveryCancellation.Token);
+
+                    if (completed)
+                    {
+                        await queue.CompleteAsync(delivery, deliveryCancellation.Token);
+                    }
+                }
+                catch (OperationCanceledException) when (deliveryCancellation.IsCancellationRequested)
+                {
+                    await TryAbandonAsync(delivery);
+                }
+                catch (Exception ex)
+                {
+                    logger.LogError(
+                        ex,
+                        "Unexpected failure while handling async request-reply delivery {DeliveryId} for job {JobId}.",
+                        delivery.DeliveryId,
+                        delivery.Job.Id);
+                    await TryAbandonAsync(delivery);
+                }
+                finally
+                {
+                    deliveryCancellation.Cancel();
 
                     try
                     {
-                        var completed = await ProcessDeliveryAsync(delivery, deliveryCancellation.Token);
-
-                        if (completed)
-                        {
-                            await queue.CompleteAsync(delivery, deliveryCancellation.Token);
-                        }
+                        await heartbeat;
                     }
                     catch (OperationCanceledException) when (deliveryCancellation.IsCancellationRequested)
                     {
-                        await TryAbandonAsync(delivery);
                     }
                     catch (Exception ex)
                     {
-                        logger.LogError(
+                        logger.LogWarning(
                             ex,
-                            "Unexpected failure while handling async request-reply delivery {DeliveryId} for job {JobId}.",
+                            "Delivery lease renewal stopped for delivery {DeliveryId} and job {JobId}.",
                             delivery.DeliveryId,
                             delivery.Job.Id);
-                        await TryAbandonAsync(delivery);
                     }
-                    finally
-                    {
-                        deliveryCancellation.Cancel();
-
-                        try
-                        {
-                            await heartbeat;
-                        }
-                        catch (OperationCanceledException) when (deliveryCancellation.IsCancellationRequested)
-                        {
-                        }
-                        catch (Exception ex)
-                        {
-                            logger.LogWarning(
-                                ex,
-                                "Delivery lease renewal stopped for delivery {DeliveryId} and job {JobId}.",
-                                delivery.DeliveryId,
-                                delivery.Job.Id);
-                        }
-                    }
-                });
-        }
-        catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
-        {
-        }
+                }
+            });
     }
 
     private async Task<bool> ProcessDeliveryAsync(
@@ -89,6 +107,12 @@ internal sealed class AsyncJobBackgroundService(
         var job = delivery.Job;
         var current = await statusStore.GetAsync(job.Id, cancellationToken);
         var createdAt = current?.CreatedAt ?? SystemClock.UtcNow();
+
+        if (current is not null && IsTerminal(current.Status))
+        {
+            await BeginRetentionAsync(job.Id, cancellationToken);
+            return true;
+        }
 
         if (job.ExecutionMode == AsyncExecutionMode.wait_external)
         {
@@ -160,6 +184,7 @@ internal sealed class AsyncJobBackgroundService(
 
         if (resolver is null)
         {
+            await BeginRetentionAsync(job.Id, cancellationToken);
             return true;
         }
 
@@ -226,7 +251,19 @@ internal sealed class AsyncJobBackgroundService(
         CancellationToken cancellationToken)
     {
         await statusStore.SetAsync(status, cancellationToken);
-        await tokenStore.RefreshAsync(status.Id, cancellationToken);
+
+        if (IsTerminal(status.Status))
+        {
+            await BeginRetentionAsync(status.Id, cancellationToken);
+        }
+    }
+
+    private async Task BeginRetentionAsync(
+        string jobId,
+        CancellationToken cancellationToken)
+    {
+        await statusStore.BeginRetentionAsync(jobId, cancellationToken);
+        await tokenStore.BeginRetentionAsync(jobId, cancellationToken);
     }
 
     private async Task RenewLeaseAsync(
@@ -267,5 +304,10 @@ internal sealed class AsyncJobBackgroundService(
                 delivery.DeliveryId,
                 delivery.Job.Id);
         }
+    }
+
+    private static bool IsTerminal(AsyncJobStatus status)
+    {
+        return status is AsyncJobStatus.completed or AsyncJobStatus.failed;
     }
 }

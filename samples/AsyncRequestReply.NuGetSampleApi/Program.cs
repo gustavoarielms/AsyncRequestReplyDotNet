@@ -5,7 +5,7 @@ var builder = WebApplication.CreateBuilder(args);
 builder.Services.AddAsyncRequestReply(options =>
 {
     options.StatusBasePath = "/async-status";
-    options.ExposeStatusEndpoint = true;
+    options.AllowCapabilityStatusAccess = true;
 });
 builder.Services.AddSingleton<IAsyncJobProcessor, InvoiceProcessor>();
 
@@ -15,7 +15,7 @@ app.MapGet("/", () => Results.Ok(new
 {
     service = "AsyncRequestReply NuGet sample",
     submit = "POST /invoices",
-    status = "GET /async-status/status/{jobId}"
+    status = "GET /async-status/status/{jobId}/{accessToken}"
 }));
 
 app.MapAsyncRequestReplyStatusEndpoints();

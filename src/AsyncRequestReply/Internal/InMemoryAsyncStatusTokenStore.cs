@@ -6,7 +6,10 @@ namespace AsyncRequestReply.Internal;
 
 internal sealed class InMemoryAsyncStatusTokenStore : IAsyncStatusTokenStore
 {
-    private sealed record Entry(byte[] TokenHash, DateTimeOffset ExpiresAt);
+    private sealed record Entry(
+        byte[] TokenHash,
+        DateTimeOffset CreatedAt,
+        DateTimeOffset? ExpiresAt);
 
     private readonly ConcurrentDictionary<string, Entry> tokens = new();
     private readonly object writeLock = new();
@@ -29,7 +32,7 @@ internal sealed class InMemoryAsyncStatusTokenStore : IAsyncStatusTokenStore
 
             if (!tokens.ContainsKey(jobId) && tokens.Count >= options.StatusCapacity)
             {
-                var oldest = tokens.MinBy(pair => pair.Value.ExpiresAt);
+                var oldest = tokens.MinBy(pair => pair.Value.ExpiresAt ?? pair.Value.CreatedAt);
 
                 if (!oldest.Equals(default(KeyValuePair<string, Entry>)))
                 {
@@ -39,7 +42,8 @@ internal sealed class InMemoryAsyncStatusTokenStore : IAsyncStatusTokenStore
 
             tokens[jobId] = new Entry(
                 StatusAccessToken.Hash(accessToken),
-                now.Add(options.StatusTimeToLive));
+                now,
+                null);
         }
 
         return Task.CompletedTask;
@@ -55,7 +59,7 @@ internal sealed class InMemoryAsyncStatusTokenStore : IAsyncStatusTokenStore
             return Task.FromResult(false);
         }
 
-        if (entry.ExpiresAt <= DateTimeOffset.UtcNow)
+        if (entry.ExpiresAt is { } expiresAt && expiresAt <= DateTimeOffset.UtcNow)
         {
             tokens.TryRemove(jobId, out _);
             return Task.FromResult(false);
@@ -73,14 +77,19 @@ internal sealed class InMemoryAsyncStatusTokenStore : IAsyncStatusTokenStore
         return Task.CompletedTask;
     }
 
-    public Task RefreshAsync(string jobId, CancellationToken cancellationToken = default)
+    public Task BeginRetentionAsync(
+        string jobId,
+        CancellationToken cancellationToken = default)
     {
-        if (tokens.TryGetValue(jobId, out var entry))
+        lock (writeLock)
         {
-            tokens[jobId] = entry with
+            if (tokens.TryGetValue(jobId, out var entry))
             {
-                ExpiresAt = DateTimeOffset.UtcNow.Add(options.StatusTimeToLive)
-            };
+                tokens[jobId] = entry with
+                {
+                    ExpiresAt = DateTimeOffset.UtcNow.Add(options.StatusTimeToLive)
+                };
+            }
         }
 
         return Task.CompletedTask;
@@ -90,7 +99,7 @@ internal sealed class InMemoryAsyncStatusTokenStore : IAsyncStatusTokenStore
     {
         foreach (var pair in tokens)
         {
-            if (pair.Value.ExpiresAt <= now)
+            if (pair.Value.ExpiresAt is { } expiresAt && expiresAt <= now)
             {
                 tokens.TryRemove(pair.Key, out _);
             }

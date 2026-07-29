@@ -75,11 +75,21 @@ internal sealed class RedisAsyncRequestReplyStore(
     public async IAsyncEnumerable<AsyncJobDelivery> DequeueAllAsync(
         [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
-        await EnsureConsumerGroupAsync();
-
         while (!cancellationToken.IsCancellationRequested)
         {
-            var entry = await ReadNextEntryAsync();
+            StreamEntry? entry;
+
+            try
+            {
+                await EnsureConsumerGroupAsync();
+                entry = await ReadNextEntryAsync();
+            }
+            catch (Exception ex) when (IsTransient(ex))
+            {
+                throw new AsyncQueueUnavailableException(
+                    "The Redis job stream is temporarily unavailable.",
+                    ex);
+            }
 
             if (entry is null)
             {
@@ -106,7 +116,17 @@ internal sealed class RedisAsyncRequestReplyStore(
 
             if (job is null)
             {
-                await CompleteDeliveryAsync(entry.Value.Id);
+                try
+                {
+                    await CompleteDeliveryAsync(entry.Value.Id);
+                }
+                catch (Exception ex) when (IsTransient(ex))
+                {
+                    throw new AsyncQueueUnavailableException(
+                        "The Redis job stream is temporarily unavailable.",
+                        ex);
+                }
+
                 continue;
             }
 
@@ -159,7 +179,15 @@ internal sealed class RedisAsyncRequestReplyStore(
     {
         cancellationToken.ThrowIfCancellationRequested();
         var json = JsonSerializer.Serialize(status, JsonOptions);
-        await Database.StringSetAsync(StatusKey(status.Id), json, options.StatusTimeToLive);
+        await Database.StringSetAsync(StatusKey(status.Id), json);
+    }
+
+    async Task IAsyncStatusStore.BeginRetentionAsync(
+        string jobId,
+        CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        await Database.KeyExpireAsync(StatusKey(jobId), options.StatusTimeToLive);
     }
 
     public async Task DeleteAsync(string jobId, CancellationToken cancellationToken = default)
@@ -176,8 +204,7 @@ internal sealed class RedisAsyncRequestReplyStore(
         cancellationToken.ThrowIfCancellationRequested();
         await Database.StringSetAsync(
             AccessTokenKey(jobId),
-            StatusAccessToken.Hash(accessToken),
-            options.StatusTimeToLive);
+            StatusAccessToken.Hash(accessToken));
     }
 
     async Task<bool> IAsyncStatusTokenStore.ValidateAsync(
@@ -202,7 +229,7 @@ internal sealed class RedisAsyncRequestReplyStore(
         await Database.KeyDeleteAsync(AccessTokenKey(jobId));
     }
 
-    async Task IAsyncStatusTokenStore.RefreshAsync(
+    async Task IAsyncStatusTokenStore.BeginRetentionAsync(
         string jobId,
         CancellationToken cancellationToken)
     {
@@ -294,5 +321,10 @@ internal sealed class RedisAsyncRequestReplyStore(
     private string AccessTokenKey(string jobId)
     {
         return $"{options.StatusKeyPrefix}access:{jobId}";
+    }
+
+    private static bool IsTransient(Exception exception)
+    {
+        return exception is RedisConnectionException or RedisTimeoutException;
     }
 }

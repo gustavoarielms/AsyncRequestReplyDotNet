@@ -18,5 +18,5 @@ Content-Type: application/json
 
 ###
 
-GET {{AsyncRequestReply_NuGetSampleApi_HostAddress}}/async-status/status/{{jobId}}
+GET {{AsyncRequestReply_NuGetSampleApi_HostAddress}}/async-status/status/{{jobId}}/{{accessToken}}
 Accept: application/json

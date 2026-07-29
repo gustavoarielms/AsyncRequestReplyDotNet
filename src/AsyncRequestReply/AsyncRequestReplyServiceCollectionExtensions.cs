@@ -25,6 +25,9 @@ public static class AsyncRequestReplyServiceCollectionExtensions
             .Validate(value => value.StatusTimeToLive > TimeSpan.Zero, "StatusTimeToLive must be greater than zero.")
             .Validate(value => value.WorkerConcurrency > 0, "WorkerConcurrency must be greater than zero.")
             .Validate(
+                value => value.WorkerRecoveryInterval > TimeSpan.Zero,
+                "WorkerRecoveryInterval must be greater than zero.")
+            .Validate(
                 value => value.DeliveryLeaseRenewalInterval > TimeSpan.Zero,
                 "DeliveryLeaseRenewalInterval must be greater than zero.")
             .Validate(

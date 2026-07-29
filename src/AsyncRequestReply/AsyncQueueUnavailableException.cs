@@ -6,4 +6,9 @@ public sealed class AsyncQueueUnavailableException : Exception
         : base(message)
     {
     }
+
+    public AsyncQueueUnavailableException(string message, Exception innerException)
+        : base(message, innerException)
+    {
+    }
 }

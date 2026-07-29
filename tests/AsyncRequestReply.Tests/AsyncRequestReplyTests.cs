@@ -178,13 +178,16 @@ public sealed class AsyncRequestReplyTests
     }
 
     [Fact]
-    public async Task ExpiredStatus_ReturnsNotFoundAndIsRemoved()
+    public async Task TerminalStatus_ExpiresAndIsRemoved()
     {
+        var processor = new CapturingProcessor(_ => new { saved = true });
         await using var app = await TestApp.StartAsync(
-            configureOptions: options => options.StatusTimeToLive = TimeSpan.FromMilliseconds(50));
+            processor,
+            configureOptions: options => options.StatusTimeToLive = TimeSpan.FromMilliseconds(200));
         var accepted = await PostOrderAsync(app.Client);
+        await PollStatusAsync(app.Client, accepted.Location, AsyncJobStatus.completed);
 
-        await Task.Delay(150, TestContext.Current.CancellationToken);
+        await Task.Delay(350, TestContext.Current.CancellationToken);
         var response = await app.Client.GetAsync(
             accepted.Location,
             TestContext.Current.CancellationToken);
@@ -463,7 +466,7 @@ public sealed class AsyncRequestReplyTests
             var now = DateTimeOffset.UtcNow;
             await statusStore.SetAsync(new AsyncStatusResponse(
                 "job-1",
-                AsyncJobStatus.queued,
+                AsyncJobStatus.processing,
                 null,
                 null,
                 now,
@@ -478,6 +481,31 @@ public sealed class AsyncRequestReplyTests
                 "job-1",
                 "secret",
                 TestContext.Current.CancellationToken));
+
+            await Task.Delay(150, TestContext.Current.CancellationToken);
+
+            Assert.NotNull(await statusStore.GetAsync(
+                "job-1",
+                TestContext.Current.CancellationToken));
+            Assert.True(await tokenStore.ValidateAsync(
+                "job-1",
+                "secret",
+                TestContext.Current.CancellationToken));
+
+            await statusStore.SetAsync(new AsyncStatusResponse(
+                "job-1",
+                AsyncJobStatus.completed,
+                new { saved = true },
+                null,
+                now,
+                DateTimeOffset.UtcNow),
+                TestContext.Current.CancellationToken);
+            await statusStore.BeginRetentionAsync(
+                "job-1",
+                TestContext.Current.CancellationToken);
+            await tokenStore.BeginRetentionAsync(
+                "job-1",
+                TestContext.Current.CancellationToken);
 
             await Task.Delay(150, TestContext.Current.CancellationToken);
 
@@ -529,6 +557,107 @@ public sealed class AsyncRequestReplyTests
 
         Assert.Equal(AsyncJobStatus.completed, status.Status);
         Assert.True(queue.DequeueStarted);
+    }
+
+    [Fact]
+    public async Task RecoveredTerminalDelivery_DoesNotRunProcessorAgain()
+    {
+        var queue = new RedeliveringQueue();
+        var processor = new CountingProcessor();
+        await using var app = await TestApp.StartAsync(processor, services =>
+        {
+            services.AddSingleton<IAsyncJobQueue>(queue);
+            services.AddSingleton<IAsyncJobQueueReader>(queue);
+        });
+
+        var accepted = await PostOrderAsync(app.Client);
+        await queue.SecondCompletion.Task.WaitAsync(
+            TimeSpan.FromSeconds(5),
+            TestContext.Current.CancellationToken);
+        var status = await app.StatusStore.GetAsync(
+            accepted.Id,
+            TestContext.Current.CancellationToken);
+
+        Assert.NotNull(status);
+        Assert.Equal(AsyncJobStatus.completed, status!.Status);
+        Assert.Equal(1, processor.Calls);
+    }
+
+    [Fact]
+    public async Task BackgroundWorker_RetriesQueueReaderAfterUnavailableFailure()
+    {
+        var queue = new FlakyQueue();
+        var processor = new CapturingProcessor(_ => new { saved = true });
+        await using var app = await TestApp.StartAsync(
+            processor,
+            services =>
+            {
+                services.AddSingleton<IAsyncJobQueue>(queue);
+                services.AddSingleton<IAsyncJobQueueReader>(queue);
+            },
+            options => options.WorkerRecoveryInterval = TimeSpan.FromMilliseconds(10));
+
+        var accepted = await PostOrderAsync(app.Client);
+        var status = await PollStatusAsync(app.Client, accepted.Location, AsyncJobStatus.completed);
+
+        Assert.Equal(AsyncJobStatus.completed, status.Status);
+        Assert.True(queue.DequeueAttempts >= 2);
+    }
+
+    [Fact]
+    public async Task ActiveJob_KeepsStatusAndCapabilityUntilTerminalRetentionStarts()
+    {
+        var processor = new ControlledProcessor();
+        await using var app = await TestApp.StartAsync(
+            processor,
+            configureOptions: options => options.StatusTimeToLive = TimeSpan.FromMilliseconds(200));
+
+        var accepted = await PostOrderAsync(app.Client);
+        await processor.Started.Task.WaitAsync(
+            TimeSpan.FromSeconds(5),
+            TestContext.Current.CancellationToken);
+        await Task.Delay(350, TestContext.Current.CancellationToken);
+
+        var active = await app.Client.GetFromJsonAsync<AsyncStatusResponse>(
+            accepted.Location,
+            JsonOptions,
+            TestContext.Current.CancellationToken);
+
+        Assert.NotNull(active);
+        Assert.Equal(AsyncJobStatus.processing, active!.Status);
+
+        processor.Release.TrySetResult();
+        var completed = await PollStatusAsync(
+            app.Client,
+            accepted.Location,
+            AsyncJobStatus.completed);
+
+        Assert.Equal(AsyncJobStatus.completed, completed.Status);
+
+        await Task.Delay(350, TestContext.Current.CancellationToken);
+        var expired = await app.Client.GetAsync(
+            accepted.Location,
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal(HttpStatusCode.NotFound, expired.StatusCode);
+    }
+
+    [Fact]
+    public async Task WaitingExternalWithoutResolver_StartsTerminalRetention()
+    {
+        await using var app = await TestApp.StartAsync(
+            configureOptions: options => options.StatusTimeToLive = TimeSpan.FromMilliseconds(200),
+            configureEndpoint: options => options.ExecutionMode = AsyncExecutionMode.wait_external);
+
+        var accepted = await PostOrderAsync(app.Client);
+        await PollStatusAsync(app.Client, accepted.Location, AsyncJobStatus.waiting_external);
+        await Task.Delay(350, TestContext.Current.CancellationToken);
+
+        var expired = await app.Client.GetAsync(
+            accepted.Location,
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal(HttpStatusCode.NotFound, expired.StatusCode);
     }
 
     [Fact]
@@ -601,6 +730,41 @@ public sealed class AsyncRequestReplyTests
         }
     }
 
+    private sealed class CountingProcessor : IAsyncJobProcessor
+    {
+        private int calls;
+
+        public int Calls => Volatile.Read(ref calls);
+
+        public Task<object?> ProcessAsync(
+            string jobId,
+            object? payload,
+            CancellationToken cancellationToken = default)
+        {
+            Interlocked.Increment(ref calls);
+            return Task.FromResult<object?>(new { saved = true });
+        }
+    }
+
+    private sealed class ControlledProcessor : IAsyncJobProcessor
+    {
+        public TaskCompletionSource Started { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public TaskCompletionSource Release { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public async Task<object?> ProcessAsync(
+            string jobId,
+            object? payload,
+            CancellationToken cancellationToken = default)
+        {
+            Started.TrySetResult();
+            await Release.Task.WaitAsync(cancellationToken);
+            return new { saved = true };
+        }
+    }
+
     private sealed class CapturingResolver(
         Func<AsyncStatusResponse, AsyncStatusResponse?> resolve) : IExternalStatusResolver
     {
@@ -666,6 +830,118 @@ public sealed class AsyncRequestReplyTests
         }
     }
 
+    private sealed class RedeliveringQueue : IAsyncJobQueue, IAsyncJobQueueReader
+    {
+        private readonly Channel<AsyncJobDelivery> channel = Channel.CreateUnbounded<AsyncJobDelivery>();
+        private int completions;
+
+        public TaskCompletionSource SecondCompletion { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public ValueTask EnqueueAsync(
+            string jobId,
+            object? payload,
+            AsyncExecutionMode executionMode,
+            CancellationToken cancellationToken = default)
+        {
+            return channel.Writer.WriteAsync(
+                new AsyncJobDelivery(
+                    "delivery-1",
+                    new AsyncJobEnvelope(jobId, payload, executionMode)),
+                cancellationToken);
+        }
+
+        public async IAsyncEnumerable<AsyncJobDelivery> DequeueAllAsync(
+            [EnumeratorCancellation] CancellationToken cancellationToken = default)
+        {
+            await foreach (var delivery in channel.Reader.ReadAllAsync(cancellationToken))
+            {
+                yield return delivery;
+            }
+        }
+
+        public ValueTask CompleteAsync(
+            AsyncJobDelivery delivery,
+            CancellationToken cancellationToken = default)
+        {
+            if (Interlocked.Increment(ref completions) == 1)
+            {
+                return channel.Writer.WriteAsync(delivery, cancellationToken);
+            }
+
+            SecondCompletion.TrySetResult();
+            return ValueTask.CompletedTask;
+        }
+
+        public ValueTask RenewAsync(
+            AsyncJobDelivery delivery,
+            CancellationToken cancellationToken = default)
+        {
+            return ValueTask.CompletedTask;
+        }
+
+        public ValueTask AbandonAsync(
+            AsyncJobDelivery delivery,
+            CancellationToken cancellationToken = default)
+        {
+            return ValueTask.CompletedTask;
+        }
+    }
+
+    private sealed class FlakyQueue : IAsyncJobQueue, IAsyncJobQueueReader
+    {
+        private readonly Channel<AsyncJobEnvelope> channel = Channel.CreateUnbounded<AsyncJobEnvelope>();
+        private int dequeueAttempts;
+
+        public int DequeueAttempts => Volatile.Read(ref dequeueAttempts);
+
+        public ValueTask EnqueueAsync(
+            string jobId,
+            object? payload,
+            AsyncExecutionMode executionMode,
+            CancellationToken cancellationToken = default)
+        {
+            return channel.Writer.WriteAsync(
+                new AsyncJobEnvelope(jobId, payload, executionMode),
+                cancellationToken);
+        }
+
+        public async IAsyncEnumerable<AsyncJobDelivery> DequeueAllAsync(
+            [EnumeratorCancellation] CancellationToken cancellationToken = default)
+        {
+            if (Interlocked.Increment(ref dequeueAttempts) == 1)
+            {
+                throw new AsyncQueueUnavailableException("transient");
+            }
+
+            await foreach (var job in channel.Reader.ReadAllAsync(cancellationToken))
+            {
+                yield return new AsyncJobDelivery(job.Id, job);
+            }
+        }
+
+        public ValueTask CompleteAsync(
+            AsyncJobDelivery delivery,
+            CancellationToken cancellationToken = default)
+        {
+            return ValueTask.CompletedTask;
+        }
+
+        public ValueTask RenewAsync(
+            AsyncJobDelivery delivery,
+            CancellationToken cancellationToken = default)
+        {
+            return ValueTask.CompletedTask;
+        }
+
+        public ValueTask AbandonAsync(
+            AsyncJobDelivery delivery,
+            CancellationToken cancellationToken = default)
+        {
+            return ValueTask.CompletedTask;
+        }
+    }
+
     private sealed class RejectingQueue : IAsyncJobQueue
     {
         public ValueTask EnqueueAsync(
@@ -703,6 +979,13 @@ public sealed class AsyncRequestReplyTests
             CancellationToken cancellationToken = default)
         {
             Statuses.Remove(jobId);
+            return Task.CompletedTask;
+        }
+
+        public Task BeginRetentionAsync(
+            string jobId,
+            CancellationToken cancellationToken = default)
+        {
             return Task.CompletedTask;
         }
     }

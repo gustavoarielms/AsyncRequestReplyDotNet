@@ -32,3 +32,16 @@ jobs:
 
       - name: Pack library
         run: dotnet pack src/AsyncRequestReply/AsyncRequestReply.csproj --configuration Release --no-build --output ./artifacts
+
+      - name: Restore NuGet sample from packed artifact
+        run: >-
+          dotnet restore
+          samples/AsyncRequestReply.NuGetSampleApi/AsyncRequestReply.NuGetSampleApi.csproj
+          --configfile samples/AsyncRequestReply.NuGetSampleApi/NuGet.config
+
+      - name: Build NuGet sample
+        run: >-
+          dotnet build
+          samples/AsyncRequestReply.NuGetSampleApi/AsyncRequestReply.NuGetSampleApi.csproj
+          --configuration Release
+          --no-restore

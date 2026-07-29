@@ -33,6 +33,7 @@ builder.Services.AddAsyncRequestReply(options =>
     options.AllowCapabilityStatusAccess = true;
     options.QueueCapacity = 1_000;
     options.StatusTimeToLive = TimeSpan.FromHours(1);
+    options.WorkerRecoveryInterval = TimeSpan.FromSeconds(1);
 });
 
 builder.Services.AddSingleton<IAsyncJobProcessor, OrderProcessor>();
@@ -75,11 +76,11 @@ builder.Services.AddAsyncRequestReplyRedis(options =>
 });
 ```
 
-Redis support uses Streams and consumer groups, requires Redis 6.2 or later, and acknowledges a delivery before deleting it. Pending deliveries whose lease expires can be claimed by another instance. Enqueue capacity is checked atomically, and both statuses and capability-token hashes use the configured TTL.
+Redis support uses Streams and consumer groups, requires Redis 6.2 or later, and acknowledges a delivery before deleting it. Pending deliveries whose lease expires can be claimed by another instance. Enqueue capacity is checked atomically. Active status and capability-token entries remain available while work is queued or processing; their configured TTL starts when the job reaches a terminal state.
 
 Remote Redis endpoints require TLS. `AllowUnencryptedRemoteConnection` is an explicit opt-out for a trusted private network; loopback development connections remain allowed without TLS.
 
-Hosts that provide a distributed custom transport should register `IAsyncJobQueue`, `IAsyncJobQueueReader`, `IAsyncStatusStore`, and `IAsyncStatusTokenStore`.
+Hosts that provide a distributed custom transport should register `IAsyncJobQueue`, `IAsyncJobQueueReader`, `IAsyncStatusStore`, and `IAsyncStatusTokenStore`. Custom status stores keep active entries available until `BeginRetentionAsync` starts their terminal retention period.
 
 ## Async endpoint
 
@@ -170,7 +171,7 @@ Status responses include `Cache-Control: no-store`. The GET endpoint is read-onl
 
 ## Limits and retention
 
-The in-memory queue and status store are bounded. `AsyncRequestReplyOptions` controls queue capacity and enqueue timeout, status capacity and TTL, worker concurrency, delivery lease renewal, and external-resolution retry behavior. A full queue returns `503 Service Unavailable` with `Retry-After`; an oversized endpoint payload returns `413 Payload Too Large`.
+The in-memory queue and status store are bounded. `AsyncRequestReplyOptions` controls queue capacity and enqueue timeout, status capacity and terminal-state TTL, worker concurrency and recovery, delivery lease renewal, and external-resolution retry behavior. Active jobs do not expire while queued or processing. A full queue returns `503 Service Unavailable` with `Retry-After`; an oversized endpoint payload returns `413 Payload Too Large`.
 
 ## Commands
 
@@ -190,10 +191,20 @@ ASYNC_REQUEST_REPLY_REDIS_CONNECTION=localhost:6379 \
 
 ## NuGet sample app
 
-This repository also includes a standalone sample that consumes the published package instead of the local project:
+This repository also includes a standalone sample that consumes the generated NuGet package instead of the local project:
 
 ```bash
-dotnet run --project samples/AsyncRequestReply.NuGetSampleApi
+dotnet pack src/AsyncRequestReply/AsyncRequestReply.csproj \
+  --configuration Release \
+  --output ./artifacts
+
+dotnet restore \
+  samples/AsyncRequestReply.NuGetSampleApi/AsyncRequestReply.NuGetSampleApi.csproj \
+  --configfile samples/AsyncRequestReply.NuGetSampleApi/NuGet.config
+
+dotnet run \
+  --project samples/AsyncRequestReply.NuGetSampleApi \
+  --no-restore
 ```
 
 The app listens on `http://localhost:5088` and uses only the package's built-in in-memory queue and status store, so no Redis, database, or broker is required unless you opt into Redis.

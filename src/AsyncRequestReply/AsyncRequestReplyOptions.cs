@@ -16,6 +16,8 @@ public sealed class AsyncRequestReplyOptions
 
     public int WorkerConcurrency { get; set; } = 4;
 
+    public TimeSpan WorkerRecoveryInterval { get; set; } = TimeSpan.FromSeconds(1);
+
     public TimeSpan DeliveryLeaseRenewalInterval { get; set; } = TimeSpan.FromSeconds(15);
 
     public TimeSpan ExternalResolutionInterval { get; set; } = TimeSpan.FromSeconds(1);

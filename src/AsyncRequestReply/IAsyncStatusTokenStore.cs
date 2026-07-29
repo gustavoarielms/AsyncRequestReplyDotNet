@@ -12,7 +12,7 @@ public interface IAsyncStatusTokenStore
         string accessToken,
         CancellationToken cancellationToken = default);
 
-    Task RefreshAsync(string jobId, CancellationToken cancellationToken = default);
+    Task BeginRetentionAsync(string jobId, CancellationToken cancellationToken = default);
 
     Task DeleteAsync(string jobId, CancellationToken cancellationToken = default);
 }

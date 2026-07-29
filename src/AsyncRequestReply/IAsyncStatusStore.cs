@@ -6,5 +6,7 @@ public interface IAsyncStatusStore
 
     Task SetAsync(AsyncStatusResponse status, CancellationToken cancellationToken = default);
 
+    Task BeginRetentionAsync(string jobId, CancellationToken cancellationToken = default);
+
     Task DeleteAsync(string jobId, CancellationToken cancellationToken = default);
 }
