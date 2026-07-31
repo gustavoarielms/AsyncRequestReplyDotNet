@@ -17,7 +17,8 @@ internal sealed class RedisAsyncRequestReplyStore(
     IAsyncJobQueueReader,
     IAsyncJobSubmissionStore,
     IAsyncStatusStore,
-    IAsyncStatusTokenStore
+    IAsyncStatusTokenStore,
+    IAsyncJobTerminalStore
 {
     private const string JobField = "job";
     private const string EnqueueScript = """
@@ -45,6 +46,17 @@ internal sealed class RedisAsyncRequestReplyStore(
         if #pending == 0 or pending[1][2] ~= ARGV[2] then
             return 0
         end
+        redis.call('XACK', KEYS[1], ARGV[1], ARGV[3])
+        redis.call('XDEL', KEYS[1], ARGV[3])
+        return 1
+        """;
+    private const string CompleteTerminalScript = """
+        local pending = redis.call('XPENDING', KEYS[1], ARGV[1], ARGV[3], ARGV[3], 1)
+        if #pending == 0 or pending[1][2] ~= ARGV[2] then
+            return 0
+        end
+        redis.call('SET', KEYS[2], ARGV[4], 'PX', ARGV[5])
+        redis.call('PEXPIRE', KEYS[3], ARGV[5])
         redis.call('XACK', KEYS[1], ARGV[1], ARGV[3])
         redis.call('XDEL', KEYS[1], ARGV[3])
         return 1
@@ -101,9 +113,11 @@ internal sealed class RedisAsyncRequestReplyStore(
                         "The Redis submission exceeded its enqueue timeout."));
             }
 
+            Task<RedisResult>? submission = null;
+
             try
             {
-                var result = await Database.ScriptEvaluateAsync(
+                submission = Database.ScriptEvaluateAsync(
                     SubmitScript,
                     [options.StreamKey, StatusKey(jobId), AccessTokenKey(jobId)],
                     [
@@ -112,7 +126,8 @@ internal sealed class RedisAsyncRequestReplyStore(
                         statusJson,
                         accessToken is null ? 0 : 1,
                         tokenHash
-                    ]).WaitAsync(remaining, cancellationToken);
+                    ]);
+                var result = await submission.WaitAsync(remaining, cancellationToken);
 
                 if ((long)result == 0)
                 {
@@ -121,7 +136,12 @@ internal sealed class RedisAsyncRequestReplyStore(
 
                 return;
             }
-            catch (Exception ex) when (ex is TimeoutException || IsTransient(ex))
+            catch (TimeoutException)
+            {
+                _ = ObserveAmbiguousSubmissionAsync(submission!, jobId);
+                return;
+            }
+            catch (Exception ex) when (IsTransient(ex))
             {
                 lastTransientError = ex;
                 remaining = enqueueTimeout - elapsed.Elapsed;
@@ -185,6 +205,16 @@ internal sealed class RedisAsyncRequestReplyStore(
                 await EnsureConsumerGroupAsync();
                 entry = await ReadNextEntryAsync();
             }
+            catch (RedisServerException ex) when (IsNoGroup(ex))
+            {
+                logger.LogWarning(
+                    ex,
+                    "Redis consumer group {ConsumerGroup} disappeared. Recreating it before continuing.",
+                    options.ConsumerGroup);
+                groupCreated = false;
+                autoClaimCursor = "0-0";
+                continue;
+            }
             catch (Exception ex) when (IsTransient(ex))
             {
                 throw new AsyncQueueUnavailableException(
@@ -241,6 +271,33 @@ internal sealed class RedisAsyncRequestReplyStore(
     {
         cancellationToken.ThrowIfCancellationRequested();
         await CompleteDeliveryAsync(delivery.DeliveryId);
+    }
+
+    public async ValueTask CompleteTerminalAsync(
+        AsyncJobDelivery delivery,
+        AsyncStatusResponse status,
+        CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        var json = JsonSerializer.Serialize(status, JsonOptions);
+        var retentionMilliseconds = Math.Max(
+            1,
+            (long)Math.Ceiling(options.StatusTimeToLive.TotalMilliseconds));
+        var result = await Database.ScriptEvaluateAsync(
+            CompleteTerminalScript,
+            [options.StreamKey, StatusKey(status.Id), AccessTokenKey(status.Id)],
+            [
+                options.ConsumerGroup,
+                consumerName,
+                delivery.DeliveryId,
+                json,
+                retentionMilliseconds
+            ]);
+
+        if ((long)result == 0)
+        {
+            throw new AsyncDeliveryLeaseLostException(delivery.DeliveryId);
+        }
     }
 
     public async ValueTask RenewAsync(
@@ -436,5 +493,27 @@ internal sealed class RedisAsyncRequestReplyStore(
     private static bool IsTransient(Exception exception)
     {
         return exception is RedisConnectionException or RedisTimeoutException;
+    }
+
+    private static bool IsNoGroup(RedisServerException exception)
+    {
+        return exception.Message.StartsWith("NOGROUP", StringComparison.Ordinal);
+    }
+
+    private async Task ObserveAmbiguousSubmissionAsync(
+        Task<RedisResult> submission,
+        string jobId)
+    {
+        try
+        {
+            await submission;
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning(
+                ex,
+                "Redis submission for job {JobId} failed after the HTTP acceptance timeout elapsed.",
+                jobId);
+        }
     }
 }

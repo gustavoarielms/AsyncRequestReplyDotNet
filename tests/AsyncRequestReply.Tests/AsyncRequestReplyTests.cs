@@ -13,6 +13,7 @@ using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Options;
+using AsyncRequestReply.Internal;
 
 namespace AsyncRequestReply.Tests;
 
@@ -927,7 +928,7 @@ public sealed class AsyncRequestReplyTests
 
     [Fact]
     [Trait("Category", "RedisIntegration")]
-    public async Task RedisSubmission_EnqueueTimeoutBoundsInFlightCommandAndRemainsIdempotent()
+    public async Task RedisSubmission_EnqueueTimeoutTreatsInFlightCommandAsAcceptedAndRemainsIdempotent()
     {
         var configuration = Environment.GetEnvironmentVariable("ASYNC_REQUEST_REPLY_REDIS_CONNECTION");
 
@@ -970,13 +971,12 @@ public sealed class AsyncRequestReplyTests
             await server.ExecuteAsync("CLIENT", "PAUSE", 1_500, "ALL");
             var elapsed = Stopwatch.StartNew();
 
-            await Assert.ThrowsAsync<AsyncQueueUnavailableException>(
-                () => submissionStore.SubmitAsync(
-                    "job-1",
-                    new { value = 1 },
-                    AsyncExecutionMode.resolve_now,
-                    "secret-1",
-                    TestContext.Current.CancellationToken).AsTask());
+            await submissionStore.SubmitAsync(
+                "job-1",
+                new { value = 1 },
+                AsyncExecutionMode.resolve_now,
+                "secret-1",
+                TestContext.Current.CancellationToken);
             elapsed.Stop();
 
             Assert.True(
@@ -1014,6 +1014,87 @@ public sealed class AsyncRequestReplyTests
                     $"{statusPrefix}job-1",
                     $"{statusPrefix}access:job-1"
                 ]);
+        }
+    }
+
+    [Fact]
+    [Trait("Category", "RedisIntegration")]
+    public async Task AsyncEndpoint_InFlightRedisSubmissionReturnsAcceptedLocation()
+    {
+        var configuration = Environment.GetEnvironmentVariable("ASYNC_REQUEST_REPLY_REDIS_CONNECTION");
+
+        if (string.IsNullOrWhiteSpace(configuration))
+        {
+            Assert.Skip("Set ASYNC_REQUEST_REPLY_REDIS_CONNECTION to run the Redis integration test.");
+        }
+
+        var suffix = Guid.NewGuid().ToString("N");
+        var streamKey = $"async-request-reply:{{{suffix}}}:jobs";
+        var statusPrefix = $"async-request-reply:{{{suffix}}}:status:";
+        await using var app = await TestApp.StartAsync(
+            configureServices: services => services.AddAsyncRequestReplyRedis(options =>
+            {
+                options.Configuration = configuration;
+                options.StreamKey = streamKey;
+                options.ConsumerGroup = $"group-{suffix}";
+                options.StatusKeyPrefix = statusPrefix;
+                options.QueuePollInterval = TimeSpan.FromMilliseconds(10);
+                options.ClaimIdleTime = TimeSpan.FromMilliseconds(50);
+            }),
+            configureOptions: options =>
+            {
+                options.EnqueueTimeout = TimeSpan.FromMilliseconds(200);
+                options.DeliveryLeaseRenewalInterval = TimeSpan.FromMilliseconds(10);
+            });
+        var adminOptions = StackExchange.Redis.ConfigurationOptions.Parse(configuration);
+        adminOptions.AllowAdmin = true;
+        await using var adminConnection =
+            await StackExchange.Redis.ConnectionMultiplexer.ConnectAsync(adminOptions);
+        var server = adminConnection.GetServer(adminConnection.GetEndPoints().Single());
+        var database = adminConnection.GetDatabase();
+        AsyncAcceptedResponse? accepted = null;
+
+        try
+        {
+            await server.ExecuteAsync("CLIENT", "PAUSE", 1_500, "ALL");
+            var elapsed = Stopwatch.StartNew();
+            var response = await app.Client.PostAsJsonAsync(
+                "/orders",
+                new { data = new { name = "order-1" } },
+                TestContext.Current.CancellationToken);
+            elapsed.Stop();
+            accepted = await response.Content.ReadFromJsonAsync<AsyncAcceptedResponse>(
+                JsonOptions,
+                TestContext.Current.CancellationToken);
+
+            Assert.Equal(HttpStatusCode.Accepted, response.StatusCode);
+            Assert.NotNull(accepted);
+            Assert.Equal(response.Headers.Location?.OriginalString, accepted!.Location);
+            Assert.True(
+                elapsed.Elapsed < TimeSpan.FromSeconds(1),
+                $"HTTP acceptance exceeded its timeout budget: {elapsed.Elapsed}.");
+
+            await Task.Delay(
+                TimeSpan.FromMilliseconds(1_500),
+                TestContext.Current.CancellationToken);
+
+            Assert.NotNull(await app.StatusStore.GetAsync(
+                accepted.Id,
+                TestContext.Current.CancellationToken));
+            Assert.Equal(1, await database.StreamLengthAsync(streamKey));
+        }
+        finally
+        {
+            await server.ExecuteAsync("CLIENT", "UNPAUSE");
+            StackExchange.Redis.RedisKey[] keys = accepted is null
+                ? [streamKey]
+                :
+                [
+                    streamKey,
+                    $"{statusPrefix}{accepted.Id}",
+                    $"{statusPrefix}access:{accepted.Id}"
+                ];
+            await database.KeyDeleteAsync(keys);
         }
     }
 
@@ -1096,6 +1177,168 @@ public sealed class AsyncRequestReplyTests
         finally
         {
             await database.KeyDeleteAsync(streamKey);
+        }
+    }
+
+    [Fact]
+    [Trait("Category", "RedisIntegration")]
+    public async Task RedisReader_RecreatesConsumerGroupAfterNoGroup()
+    {
+        var configuration = Environment.GetEnvironmentVariable("ASYNC_REQUEST_REPLY_REDIS_CONNECTION");
+
+        if (string.IsNullOrWhiteSpace(configuration))
+        {
+            Assert.Skip("Set ASYNC_REQUEST_REPLY_REDIS_CONNECTION to run the Redis integration test.");
+        }
+
+        var suffix = Guid.NewGuid().ToString("N");
+        var streamKey = $"async-request-reply:{{{suffix}}}:jobs";
+        var statusPrefix = $"async-request-reply:{{{suffix}}}:status:";
+        var services = new ServiceCollection();
+        services.AddLogging();
+        services.AddAsyncRequestReply(options =>
+        {
+            options.DeliveryLeaseRenewalInterval = TimeSpan.FromMilliseconds(10);
+        });
+        services.AddAsyncRequestReplyRedis(options =>
+        {
+            options.Configuration = configuration;
+            options.StreamKey = streamKey;
+            options.ConsumerGroup = $"group-{suffix}";
+            options.ConsumerName = $"consumer-{suffix}";
+            options.StatusKeyPrefix = statusPrefix;
+            options.QueuePollInterval = TimeSpan.FromMilliseconds(10);
+            options.ClaimIdleTime = TimeSpan.FromMilliseconds(50);
+        });
+        await using var provider = services.BuildServiceProvider();
+        var queue = provider.GetRequiredService<IAsyncJobQueue>();
+        var reader = provider.GetRequiredService<IAsyncJobQueueReader>();
+        var connection = provider.GetRequiredService<StackExchange.Redis.IConnectionMultiplexer>();
+        var database = connection.GetDatabase();
+
+        try
+        {
+            await queue.EnqueueAsync(
+                "before-reset",
+                new { value = 1 },
+                AsyncExecutionMode.resolve_now,
+                TestContext.Current.CancellationToken);
+            var first = await ReadOneAsync(reader);
+            await reader.CompleteAsync(first, TestContext.Current.CancellationToken);
+
+            await database.KeyDeleteAsync(streamKey);
+            await queue.EnqueueAsync(
+                "after-reset",
+                new { value = 2 },
+                AsyncExecutionMode.resolve_now,
+                TestContext.Current.CancellationToken);
+
+            var recovered = await ReadOneAsync(reader);
+
+            Assert.Equal("after-reset", recovered.Job.Id);
+        }
+        finally
+        {
+            await database.KeyDeleteAsync(streamKey);
+        }
+    }
+
+    [Fact]
+    [Trait("Category", "RedisIntegration")]
+    public async Task RedisTerminalCompletion_RejectsStaleConsumerWithoutOverwritingWinner()
+    {
+        var configuration = Environment.GetEnvironmentVariable("ASYNC_REQUEST_REPLY_REDIS_CONNECTION");
+
+        if (string.IsNullOrWhiteSpace(configuration))
+        {
+            Assert.Skip("Set ASYNC_REQUEST_REPLY_REDIS_CONNECTION to run the Redis integration test.");
+        }
+
+        var suffix = Guid.NewGuid().ToString("N");
+        var streamKey = $"async-request-reply:{{{suffix}}}:jobs";
+        var statusPrefix = $"async-request-reply:{{{suffix}}}:status:";
+        var group = $"group-{suffix}";
+        var firstServices = CreateRedisServices("consumer-a");
+        var secondServices = CreateRedisServices("consumer-b");
+        await using var firstProvider = firstServices.BuildServiceProvider();
+        await using var secondProvider = secondServices.BuildServiceProvider();
+        var queue = firstProvider.GetRequiredService<IAsyncJobQueue>();
+        var firstReader = firstProvider.GetRequiredService<IAsyncJobQueueReader>();
+        var secondReader = secondProvider.GetRequiredService<IAsyncJobQueueReader>();
+        var firstCompletion = Assert.IsAssignableFrom<IAsyncJobTerminalStore>(firstReader);
+        var secondCompletion = Assert.IsAssignableFrom<IAsyncJobTerminalStore>(secondReader);
+        var statusStore = firstProvider.GetRequiredService<IAsyncStatusStore>();
+        var connection = firstProvider.GetRequiredService<StackExchange.Redis.IConnectionMultiplexer>();
+        var database = connection.GetDatabase();
+
+        try
+        {
+            await queue.EnqueueAsync(
+                "job-1",
+                new { value = 1 },
+                AsyncExecutionMode.resolve_now,
+                TestContext.Current.CancellationToken);
+            var staleDelivery = await ReadOneAsync(firstReader);
+            await Task.Delay(75, TestContext.Current.CancellationToken);
+            var winningDelivery = await ReadOneAsync(secondReader);
+            var now = DateTimeOffset.UtcNow;
+            var winningStatus = new AsyncStatusResponse(
+                "job-1",
+                AsyncJobStatus.completed,
+                new { worker = "consumer-b" },
+                null,
+                now,
+                now);
+            var staleStatus = winningStatus with
+            {
+                Result = new { worker = "consumer-a" },
+                UpdatedAt = DateTimeOffset.UtcNow
+            };
+
+            await secondCompletion.CompleteTerminalAsync(
+                winningDelivery,
+                winningStatus,
+                TestContext.Current.CancellationToken);
+            await Assert.ThrowsAsync<AsyncDeliveryLeaseLostException>(
+                () => firstCompletion.CompleteTerminalAsync(
+                    staleDelivery,
+                    staleStatus,
+                    TestContext.Current.CancellationToken).AsTask());
+
+            var persisted = await statusStore.GetAsync(
+                "job-1",
+                TestContext.Current.CancellationToken);
+
+            Assert.NotNull(persisted);
+            var result = Assert.IsType<JsonElement>(persisted!.Result);
+            Assert.Equal("consumer-b", result.GetProperty("worker").GetString());
+            Assert.Equal(0, await database.StreamLengthAsync(streamKey));
+        }
+        finally
+        {
+            await database.KeyDeleteAsync(
+                [streamKey, $"{statusPrefix}job-1", $"{statusPrefix}access:job-1"]);
+        }
+
+        ServiceCollection CreateRedisServices(string consumerName)
+        {
+            var services = new ServiceCollection();
+            services.AddLogging();
+            services.AddAsyncRequestReply(options =>
+            {
+                options.DeliveryLeaseRenewalInterval = TimeSpan.FromMilliseconds(10);
+            });
+            services.AddAsyncRequestReplyRedis(options =>
+            {
+                options.Configuration = configuration;
+                options.StreamKey = streamKey;
+                options.ConsumerGroup = group;
+                options.ConsumerName = $"{consumerName}-{suffix}";
+                options.StatusKeyPrefix = statusPrefix;
+                options.QueuePollInterval = TimeSpan.FromMilliseconds(10);
+                options.ClaimIdleTime = TimeSpan.FromMilliseconds(50);
+            });
+            return services;
         }
     }
 

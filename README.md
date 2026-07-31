@@ -76,11 +76,11 @@ builder.Services.AddAsyncRequestReplyRedis(options =>
 });
 ```
 
-Redis support uses Streams and consumer groups, requires Redis 6.2 or later, and acknowledges a delivery before deleting it. Pending deliveries whose lease expires can be claimed by another instance. Submission atomically checks stream capacity, adds the delivery, and creates its queued status and capability hash. Retrying the same `jobId` is idempotent and does not add a second stream entry. Transient Redis failures are retried with the same `jobId` until `EnqueueTimeout` is exhausted.
+Redis support uses Streams and consumer groups, requires Redis 6.2 or later, and acknowledges a delivery before deleting it. Pending deliveries whose lease expires can be claimed by another instance, and a missing consumer group is recreated automatically. Submission atomically checks stream capacity, adds the delivery, and creates its queued status and capability hash. Retrying the same `jobId` is idempotent and does not add a second stream entry. Transient Redis failures are retried with the same `jobId` until `EnqueueTimeout` is exhausted. If that timeout expires while the Redis command is still in flight, the submission is treated as accepted so the endpoint returns the generated `jobId` and polling location instead of inviting a duplicate HTTP retry.
 
 `StreamKey` and `StatusKeyPrefix` must contain the same non-empty Redis hash tag, as in the defaults above. This keeps all keys used by the submission Lua script in one Redis Cluster hash slot.
 
-Delivery remains at-least-once: a worker can receive the same job again after a lost ACK, expired lease, or ambiguous connection failure. Every `IAsyncJobProcessor` implementation must therefore be idempotent for a given `jobId`.
+Delivery remains at-least-once: a worker can receive the same job again after a lost ACK, expired lease, or ambiguous connection failure. Every `IAsyncJobProcessor` implementation must therefore be idempotent for a given `jobId`. Redis persists terminal state, starts status and capability retention, and acknowledges the delivery atomically only while the worker still owns its lease, preventing a stale consumer from overwriting the winner.
 
 Remote Redis endpoints require TLS. `AllowUnencryptedRemoteConnection` is an explicit opt-out for a trusted private network; loopback development connections remain allowed without TLS.
 
@@ -188,7 +188,7 @@ dotnet pack src/AsyncRequestReply/AsyncRequestReply.csproj -c Release
 dotnet list package --vulnerable --include-transitive
 ```
 
-Redis integration tests verify queue capacity, atomic/idempotent submission, pending-delivery cursor recovery, acknowledgements, and real TTL behavior:
+Redis integration tests verify queue capacity, atomic/idempotent submission, ambiguous acceptance, pending-delivery cursor and consumer-group recovery, lease-fenced terminal completion, acknowledgements, and real TTL behavior:
 
 ```bash
 ASYNC_REQUEST_REPLY_REDIS_CONNECTION=localhost:6379 \

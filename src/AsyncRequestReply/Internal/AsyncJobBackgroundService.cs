@@ -57,11 +57,11 @@ internal sealed class AsyncJobBackgroundService(
 
                 try
                 {
-                    var completed = await ProcessDeliveryAsync(delivery, deliveryCancellation.Token);
+                    var result = await ProcessDeliveryAsync(delivery, deliveryCancellation.Token);
 
-                    if (completed)
+                    if (result.Complete)
                     {
-                        await queue.CompleteAsync(delivery, deliveryCancellation.Token);
+                        await CompleteDeliveryAsync(delivery, result, deliveryCancellation.Token);
                     }
                 }
                 catch (OperationCanceledException) when (deliveryCancellation.IsCancellationRequested)
@@ -100,7 +100,7 @@ internal sealed class AsyncJobBackgroundService(
             });
     }
 
-    private async Task<bool> ProcessDeliveryAsync(
+    private async Task<DeliveryResult> ProcessDeliveryAsync(
         AsyncJobDelivery delivery,
         CancellationToken cancellationToken)
     {
@@ -110,8 +110,7 @@ internal sealed class AsyncJobBackgroundService(
 
         if (current is not null && IsTerminal(current.Status))
         {
-            await BeginRetentionAsync(job.Id, cancellationToken);
-            return true;
+            return DeliveryResult.Terminal(current);
         }
 
         if (job.ExecutionMode == AsyncExecutionMode.wait_external)
@@ -125,7 +124,7 @@ internal sealed class AsyncJobBackgroundService(
         {
             await queue.AbandonAsync(delivery, cancellationToken);
             await Task.Delay(options.ExternalResolutionInterval, cancellationToken);
-            return false;
+            return DeliveryResult.Incomplete;
         }
 
         await SetStatusAsync(new AsyncStatusResponse(
@@ -149,28 +148,25 @@ internal sealed class AsyncJobBackgroundService(
         catch (Exception ex)
         {
             logger.LogError(ex, "Async request-reply job {JobId} failed.", job.Id);
-            await SetStatusAsync(new AsyncStatusResponse(
+            return DeliveryResult.Terminal(new AsyncStatusResponse(
                 job.Id,
                 AsyncJobStatus.failed,
                 null,
                 $"Job processing failed. Reference: {job.Id}.",
                 createdAt,
-                SystemClock.UtcNow()), cancellationToken);
-            return true;
+                SystemClock.UtcNow()));
         }
 
-        await SetStatusAsync(new AsyncStatusResponse(
+        return DeliveryResult.Terminal(new AsyncStatusResponse(
             job.Id,
             AsyncJobStatus.completed,
             result,
             null,
             createdAt,
-            SystemClock.UtcNow()), cancellationToken);
-
-        return true;
+            SystemClock.UtcNow()));
     }
 
-    private async Task<bool> ResolveExternalAsync(
+    private async Task<DeliveryResult> ResolveExternalAsync(
         AsyncJobEnvelope job,
         AsyncStatusResponse? persistedStatus,
         DateTimeOffset createdAt,
@@ -199,7 +195,7 @@ internal sealed class AsyncJobBackgroundService(
         if (resolver is null)
         {
             await BeginRetentionAsync(job.Id, cancellationToken);
-            return true;
+            return DeliveryResult.CompleteWithoutTerminal;
         }
 
         for (var attempt = 1; attempt <= options.ExternalResolutionMaxAttempts; attempt++)
@@ -260,13 +256,12 @@ internal sealed class AsyncJobBackgroundService(
 
             if (resolved is not null)
             {
-                await SetStatusAsync(resolved, cancellationToken);
-
                 if (IsTerminal(resolved.Status))
                 {
-                    return true;
+                    return DeliveryResult.Terminal(resolved);
                 }
 
+                await SetStatusAsync(resolved, cancellationToken);
                 currentStatus = resolved;
             }
 
@@ -276,15 +271,35 @@ internal sealed class AsyncJobBackgroundService(
             }
         }
 
-        await SetStatusAsync(new AsyncStatusResponse(
+        return DeliveryResult.Terminal(new AsyncStatusResponse(
             job.Id,
             AsyncJobStatus.failed,
             null,
             $"External status resolution failed. Reference: {job.Id}.",
             createdAt,
-            SystemClock.UtcNow()), cancellationToken);
+            SystemClock.UtcNow()));
+    }
 
-        return true;
+    private async Task CompleteDeliveryAsync(
+        AsyncJobDelivery delivery,
+        DeliveryResult result,
+        CancellationToken cancellationToken)
+    {
+        if (result.TerminalStatus is not null)
+        {
+            if (queue is IAsyncJobTerminalStore terminalStore)
+            {
+                await terminalStore.CompleteTerminalAsync(
+                    delivery,
+                    result.TerminalStatus,
+                    cancellationToken);
+                return;
+            }
+
+            await SetStatusAsync(result.TerminalStatus, cancellationToken);
+        }
+
+        await queue.CompleteAsync(delivery, cancellationToken);
     }
 
     private async Task SetStatusAsync(
@@ -350,5 +365,16 @@ internal sealed class AsyncJobBackgroundService(
     private static bool IsTerminal(AsyncJobStatus status)
     {
         return status is AsyncJobStatus.completed or AsyncJobStatus.failed;
+    }
+
+    private readonly record struct DeliveryResult(
+        bool Complete,
+        AsyncStatusResponse? TerminalStatus)
+    {
+        public static DeliveryResult Incomplete => new(false, null);
+
+        public static DeliveryResult CompleteWithoutTerminal => new(true, null);
+
+        public static DeliveryResult Terminal(AsyncStatusResponse status) => new(true, status);
     }
 }
