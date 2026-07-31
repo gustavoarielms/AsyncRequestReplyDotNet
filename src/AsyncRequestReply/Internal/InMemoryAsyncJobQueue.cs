@@ -11,6 +11,7 @@ internal sealed class InMemoryAsyncJobQueue :
 {
     private readonly Channel<AsyncJobEnvelope> channel;
     private readonly TimeSpan enqueueTimeout;
+    private readonly SemaphoreSlim admissionSlots;
     private readonly InMemoryAsyncStatusStore statusStore;
 
     public InMemoryAsyncJobQueue(
@@ -19,6 +20,7 @@ internal sealed class InMemoryAsyncJobQueue :
     {
         this.statusStore = statusStore;
         enqueueTimeout = options.Value.EnqueueTimeout;
+        admissionSlots = new SemaphoreSlim(options.Value.QueueCapacity, options.Value.QueueCapacity);
         channel = Channel.CreateBounded<AsyncJobEnvelope>(new BoundedChannelOptions(options.Value.QueueCapacity)
         {
             FullMode = BoundedChannelFullMode.Wait,
@@ -63,13 +65,24 @@ internal sealed class InMemoryAsyncJobQueue :
 
         try
         {
-            await channel.Writer.WriteAsync(
-                new AsyncJobEnvelope(jobId, payload, executionMode),
-                timeout.Token);
+            await admissionSlots.WaitAsync(timeout.Token);
         }
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
         {
             throw new AsyncQueueUnavailableException("The in-memory job queue is full.");
+        }
+
+        try
+        {
+            if (!channel.Writer.TryWrite(new AsyncJobEnvelope(jobId, payload, executionMode)))
+            {
+                throw new InvalidOperationException("The in-memory job queue admission invariant was violated.");
+            }
+        }
+        catch
+        {
+            admissionSlots.Release();
+            throw;
         }
     }
 
@@ -86,6 +99,8 @@ internal sealed class InMemoryAsyncJobQueue :
         AsyncJobDelivery delivery,
         CancellationToken cancellationToken = default)
     {
+        cancellationToken.ThrowIfCancellationRequested();
+        admissionSlots.Release();
         return ValueTask.CompletedTask;
     }
 
@@ -100,9 +115,11 @@ internal sealed class InMemoryAsyncJobQueue :
         AsyncJobDelivery delivery,
         CancellationToken cancellationToken = default)
     {
+        cancellationToken.ThrowIfCancellationRequested();
+
         if (!channel.Writer.TryWrite(delivery.Job))
         {
-            throw new AsyncQueueUnavailableException("The in-memory job queue is full.");
+            throw new InvalidOperationException("The in-memory job queue admission invariant was violated.");
         }
 
         return ValueTask.CompletedTask;

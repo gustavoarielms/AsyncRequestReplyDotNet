@@ -29,7 +29,8 @@ public sealed class AsyncRequestReplyTests
     {
         await using var app = await TestApp.StartAsync();
 
-        var response = await app.Client.PostAsJsonAsync(
+        var response = await PostJsonAsync(
+            app.Client,
             "/orders",
             new { data = new { name = "order-1" } },
             TestContext.Current.CancellationToken);
@@ -42,7 +43,8 @@ public sealed class AsyncRequestReplyTests
     {
         await using var app = await TestApp.StartAsync();
 
-        var response = await app.Client.PostAsJsonAsync(
+        var response = await PostJsonAsync(
+            app.Client,
             "/orders",
             new { data = new { name = "order-1" } },
             TestContext.Current.CancellationToken);
@@ -56,7 +58,8 @@ public sealed class AsyncRequestReplyTests
     {
         await using var app = await TestApp.StartAsync();
 
-        var response = await app.Client.PostAsJsonAsync(
+        var response = await PostJsonAsync(
+            app.Client,
             "/orders",
             new { data = new { name = "order-1" } },
             TestContext.Current.CancellationToken);
@@ -69,6 +72,32 @@ public sealed class AsyncRequestReplyTests
         Assert.Equal(AsyncJobStatus.queued, body.Status);
         Assert.StartsWith($"/async-status/status/{body.Id}/", body.Location);
         Assert.NotEqual(body.Id, body.Location.Split('/').Last());
+    }
+
+    [Fact]
+    public async Task AsyncEndpoint_WithoutIdempotencyKey_ReturnsBadRequest()
+    {
+        await using var app = await TestApp.StartAsync();
+
+        var response = await app.Client.PostAsJsonAsync(
+            "/orders",
+            new { data = new { name = "order-1" } },
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task AsyncEndpoint_ReusedIdempotencyKeyReturnsSameSubmission()
+    {
+        await using var app = await TestApp.StartAsync();
+        var idempotencyKey = Guid.NewGuid().ToString("N");
+
+        var first = await PostOrderAsync(app.Client, idempotencyKey: idempotencyKey);
+        var second = await PostOrderAsync(app.Client, idempotencyKey: idempotencyKey);
+
+        Assert.Equal(first.Id, second.Id);
+        Assert.Equal(first.Location, second.Location);
     }
 
     [Fact]
@@ -137,7 +166,8 @@ public sealed class AsyncRequestReplyTests
         await using var app = await TestApp.StartAsync(
             configureEndpoint: options => options.MaxPayloadBytes = 16);
 
-        var response = await app.Client.PostAsJsonAsync(
+        var response = await PostJsonAsync(
+            app.Client,
             "/orders",
             new { data = new { name = "payload-that-is-too-large" } },
             TestContext.Current.CancellationToken);
@@ -151,10 +181,9 @@ public sealed class AsyncRequestReplyTests
         await using var app = await TestApp.StartAsync();
         using var content = new StringContent("{invalid", System.Text.Encoding.UTF8, "application/json");
 
-        var response = await app.Client.PostAsync(
-            "/orders",
-            content,
-            TestContext.Current.CancellationToken);
+        using var request = new HttpRequestMessage(HttpMethod.Post, "/orders") { Content = content };
+        request.Headers.Add("Idempotency-Key", Guid.NewGuid().ToString("N"));
+        var response = await app.Client.SendAsync(request, TestContext.Current.CancellationToken);
 
         Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
     }
@@ -167,7 +196,8 @@ public sealed class AsyncRequestReplyTests
             services.AddSingleton<IAsyncJobSubmissionStore, RejectingSubmissionStore>();
         });
 
-        var response = await app.Client.PostAsJsonAsync(
+        var response = await PostJsonAsync(
+            app.Client,
             "/orders",
             new { data = new { name = "order-1" } },
             TestContext.Current.CancellationToken);
@@ -263,7 +293,8 @@ public sealed class AsyncRequestReplyTests
             configureOptions: options => options.StatusCapacity = 1);
         var accepted = await PostOrderAsync(app.Client);
 
-        var rejected = await app.Client.PostAsJsonAsync(
+        var rejected = await PostJsonAsync(
+            app.Client,
             "/orders",
             new { data = new { name = "order-2" } },
             TestContext.Current.CancellationToken);
@@ -278,6 +309,53 @@ public sealed class AsyncRequestReplyTests
         Assert.NotNull(await app.StatusStore.GetAsync(
             accepted.Id,
             TestContext.Current.CancellationToken));
+    }
+
+    [Fact]
+    public async Task InMemoryQueue_ReservesCapacityUntilDeliveryCompletes()
+    {
+        var services = new ServiceCollection();
+        services.AddLogging();
+        services.AddAsyncRequestReply(options =>
+        {
+            options.QueueCapacity = 1;
+            options.EnqueueTimeout = TimeSpan.FromMilliseconds(50);
+        });
+        await using var provider = services.BuildServiceProvider();
+        var submissionStore = provider.GetRequiredService<IAsyncJobSubmissionStore>();
+        var reader = provider.GetRequiredService<IAsyncJobQueueReader>();
+        var statusStore = provider.GetRequiredService<IAsyncStatusStore>();
+
+        await submissionStore.SubmitAsync(
+            "job-a",
+            new { value = 1 },
+            AsyncExecutionMode.resolve_now,
+            "token-a",
+            TestContext.Current.CancellationToken);
+        var firstDelivery = await ReadOneAsync(reader);
+
+        await Assert.ThrowsAsync<AsyncQueueUnavailableException>(
+            () => submissionStore.SubmitAsync(
+                "job-b",
+                new { value = 2 },
+                AsyncExecutionMode.resolve_now,
+                "token-b",
+                TestContext.Current.CancellationToken).AsTask());
+        Assert.Null(await statusStore.GetAsync("job-b", TestContext.Current.CancellationToken));
+
+        await reader.AbandonAsync(firstDelivery, TestContext.Current.CancellationToken);
+        var redelivery = await ReadOneAsync(reader);
+        Assert.Equal("job-a", redelivery.Job.Id);
+
+        await reader.CompleteAsync(redelivery, TestContext.Current.CancellationToken);
+        await submissionStore.SubmitAsync(
+            "job-b",
+            new { value = 2 },
+            AsyncExecutionMode.resolve_now,
+            "token-b",
+            TestContext.Current.CancellationToken);
+
+        Assert.NotNull(await statusStore.GetAsync("job-b", TestContext.Current.CancellationToken));
     }
 
     [Fact]
@@ -928,7 +1006,7 @@ public sealed class AsyncRequestReplyTests
 
     [Fact]
     [Trait("Category", "RedisIntegration")]
-    public async Task RedisSubmission_EnqueueTimeoutTreatsInFlightCommandAsAcceptedAndRemainsIdempotent()
+    public async Task RedisSubmission_EnqueueTimeoutReturnsUnavailableAndRetryRemainsIdempotent()
     {
         var configuration = Environment.GetEnvironmentVariable("ASYNC_REQUEST_REPLY_REDIS_CONNECTION");
 
@@ -971,12 +1049,13 @@ public sealed class AsyncRequestReplyTests
             await server.ExecuteAsync("CLIENT", "PAUSE", 1_500, "ALL");
             var elapsed = Stopwatch.StartNew();
 
-            await submissionStore.SubmitAsync(
-                "job-1",
-                new { value = 1 },
-                AsyncExecutionMode.resolve_now,
-                "secret-1",
-                TestContext.Current.CancellationToken);
+            await Assert.ThrowsAsync<AsyncQueueUnavailableException>(
+                () => submissionStore.SubmitAsync(
+                    "job-1",
+                    new { value = 1 },
+                    AsyncExecutionMode.resolve_now,
+                    "secret-1",
+                    TestContext.Current.CancellationToken).AsTask());
             elapsed.Stop();
 
             Assert.True(
@@ -1019,7 +1098,80 @@ public sealed class AsyncRequestReplyTests
 
     [Fact]
     [Trait("Category", "RedisIntegration")]
-    public async Task AsyncEndpoint_InFlightRedisSubmissionReturnsAcceptedLocation()
+    public async Task RedisSubmission_RequestCancellationCanBeRetriedWithoutDuplicatingInFlightCommand()
+    {
+        var configuration = Environment.GetEnvironmentVariable("ASYNC_REQUEST_REPLY_REDIS_CONNECTION");
+
+        if (string.IsNullOrWhiteSpace(configuration))
+        {
+            Assert.Skip("Set ASYNC_REQUEST_REPLY_REDIS_CONNECTION to run the Redis integration test.");
+        }
+
+        var suffix = Guid.NewGuid().ToString("N");
+        var streamKey = $"async-request-reply:{{{suffix}}}:jobs";
+        var statusPrefix = $"async-request-reply:{{{suffix}}}:status:";
+        var services = new ServiceCollection();
+        services.AddLogging();
+        services.AddAsyncRequestReply(options =>
+        {
+            options.EnqueueTimeout = TimeSpan.FromSeconds(2);
+        });
+        services.AddAsyncRequestReplyRedis(options =>
+        {
+            options.Configuration = configuration;
+            options.StreamKey = streamKey;
+            options.ConsumerGroup = $"group-{suffix}";
+            options.StatusKeyPrefix = statusPrefix;
+            options.MaxQueueLength = 10;
+        });
+        await using var provider = services.BuildServiceProvider();
+        var submissionStore = provider.GetRequiredService<IAsyncJobSubmissionStore>();
+        var connection = provider.GetRequiredService<StackExchange.Redis.IConnectionMultiplexer>();
+        var database = connection.GetDatabase();
+        var adminOptions = StackExchange.Redis.ConfigurationOptions.Parse(configuration);
+        adminOptions.AllowAdmin = true;
+        await using var adminConnection =
+            await StackExchange.Redis.ConnectionMultiplexer.ConnectAsync(adminOptions);
+        var server = adminConnection.GetServer(adminConnection.GetEndPoints().Single());
+
+        try
+        {
+            await server.ExecuteAsync("CLIENT", "PAUSE", 1_000, "ALL");
+            using var cancellation = new CancellationTokenSource(TimeSpan.FromMilliseconds(200));
+
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(
+                () => submissionStore.SubmitAsync(
+                    "job-1",
+                    new { value = 1 },
+                    AsyncExecutionMode.resolve_now,
+                    "secret-1",
+                    cancellation.Token).AsTask());
+
+            await Task.Delay(TimeSpan.FromSeconds(1), TestContext.Current.CancellationToken);
+            await submissionStore.SubmitAsync(
+                "job-1",
+                new { value = 1 },
+                AsyncExecutionMode.resolve_now,
+                "secret-1",
+                TestContext.Current.CancellationToken);
+
+            Assert.Equal(1, await database.StreamLengthAsync(streamKey));
+        }
+        finally
+        {
+            await server.ExecuteAsync("CLIENT", "UNPAUSE");
+            await database.KeyDeleteAsync(
+                [
+                    streamKey,
+                    $"{statusPrefix}job-1",
+                    $"{statusPrefix}access:job-1"
+                ]);
+        }
+    }
+
+    [Fact]
+    [Trait("Category", "RedisIntegration")]
+    public async Task AsyncEndpoint_InFlightRedisSubmissionReturnsUnavailableAndRetryIsIdempotent()
     {
         var configuration = Environment.GetEnvironmentVariable("ASYNC_REQUEST_REPLY_REDIS_CONNECTION");
 
@@ -1053,30 +1205,32 @@ public sealed class AsyncRequestReplyTests
         var server = adminConnection.GetServer(adminConnection.GetEndPoints().Single());
         var database = adminConnection.GetDatabase();
         AsyncAcceptedResponse? accepted = null;
+        var idempotencyKey = Guid.NewGuid().ToString("N");
 
         try
         {
             await server.ExecuteAsync("CLIENT", "PAUSE", 1_500, "ALL");
             var elapsed = Stopwatch.StartNew();
-            var response = await app.Client.PostAsJsonAsync(
+            var response = await PostJsonAsync(
+                app.Client,
                 "/orders",
                 new { data = new { name = "order-1" } },
-                TestContext.Current.CancellationToken);
+                TestContext.Current.CancellationToken,
+                idempotencyKey);
             elapsed.Stop();
-            accepted = await response.Content.ReadFromJsonAsync<AsyncAcceptedResponse>(
-                JsonOptions,
-                TestContext.Current.CancellationToken);
 
-            Assert.Equal(HttpStatusCode.Accepted, response.StatusCode);
-            Assert.NotNull(accepted);
-            Assert.Equal(response.Headers.Location?.OriginalString, accepted!.Location);
+            Assert.Equal(HttpStatusCode.ServiceUnavailable, response.StatusCode);
             Assert.True(
                 elapsed.Elapsed < TimeSpan.FromSeconds(1),
-                $"HTTP acceptance exceeded its timeout budget: {elapsed.Elapsed}.");
+                $"HTTP rejection exceeded its timeout budget: {elapsed.Elapsed}.");
 
             await Task.Delay(
                 TimeSpan.FromMilliseconds(1_500),
                 TestContext.Current.CancellationToken);
+
+            accepted = await PostOrderAsync(
+                app.Client,
+                idempotencyKey: idempotencyKey);
 
             Assert.NotNull(await app.StatusStore.GetAsync(
                 accepted.Id,
@@ -1258,8 +1412,8 @@ public sealed class AsyncRequestReplyTests
         var streamKey = $"async-request-reply:{{{suffix}}}:jobs";
         var statusPrefix = $"async-request-reply:{{{suffix}}}:status:";
         var group = $"group-{suffix}";
-        var firstServices = CreateRedisServices("consumer-a");
-        var secondServices = CreateRedisServices("consumer-b");
+        var firstServices = CreateRedisServices();
+        var secondServices = CreateRedisServices();
         await using var firstProvider = firstServices.BuildServiceProvider();
         await using var secondProvider = secondServices.BuildServiceProvider();
         var queue = firstProvider.GetRequiredService<IAsyncJobQueue>();
@@ -1320,7 +1474,7 @@ public sealed class AsyncRequestReplyTests
                 [streamKey, $"{statusPrefix}job-1", $"{statusPrefix}access:job-1"]);
         }
 
-        ServiceCollection CreateRedisServices(string consumerName)
+        ServiceCollection CreateRedisServices()
         {
             var services = new ServiceCollection();
             services.AddLogging();
@@ -1333,7 +1487,7 @@ public sealed class AsyncRequestReplyTests
                 options.Configuration = configuration;
                 options.StreamKey = streamKey;
                 options.ConsumerGroup = group;
-                options.ConsumerName = $"{consumerName}-{suffix}";
+                options.ConsumerName = $"shared-consumer-{suffix}";
                 options.StatusKeyPrefix = statusPrefix;
                 options.QueuePollInterval = TimeSpan.FromMilliseconds(10);
                 options.ClaimIdleTime = TimeSpan.FromMilliseconds(50);
@@ -1511,9 +1665,32 @@ public sealed class AsyncRequestReplyTests
         Assert.Single(services, descriptor => descriptor.ServiceType == typeof(IAsyncStatusTokenStore));
     }
 
-    private static async Task<AsyncAcceptedResponse> PostOrderAsync(HttpClient client, object? body = null)
+    private static async Task<HttpResponseMessage> PostJsonAsync(
+        HttpClient client,
+        string path,
+        object body,
+        CancellationToken cancellationToken,
+        string? idempotencyKey = null)
     {
-        var response = await client.PostAsJsonAsync("/orders", body ?? new { data = new { name = "order-1" } });
+        using var request = new HttpRequestMessage(HttpMethod.Post, path)
+        {
+            Content = JsonContent.Create(body)
+        };
+        request.Headers.Add("Idempotency-Key", idempotencyKey ?? Guid.NewGuid().ToString("N"));
+        return await client.SendAsync(request, cancellationToken);
+    }
+
+    private static async Task<AsyncAcceptedResponse> PostOrderAsync(
+        HttpClient client,
+        object? body = null,
+        string? idempotencyKey = null)
+    {
+        var response = await PostJsonAsync(
+            client,
+            "/orders",
+            body ?? new { data = new { name = "order-1" } },
+            TestContext.Current.CancellationToken,
+            idempotencyKey);
         response.EnsureSuccessStatusCode();
 
         var accepted = await response.Content.ReadFromJsonAsync<AsyncAcceptedResponse>(JsonOptions);

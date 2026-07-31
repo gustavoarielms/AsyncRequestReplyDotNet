@@ -7,6 +7,7 @@ Accept: application/json
 
 POST {{AsyncRequestReply_NuGetSampleApi_HostAddress}}/invoices
 Content-Type: application/json
+Idempotency-Key: 550e8400-e29b-41d4-a716-446655440000
 
 {
   "data": {

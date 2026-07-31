@@ -78,9 +78,7 @@ internal sealed class RedisAsyncRequestReplyStore(
     private readonly RedisAsyncRequestReplyOptions options = redisOptions.Value;
     private readonly TimeSpan enqueueTimeout = requestReplyOptions.Value.EnqueueTimeout;
     private readonly SemaphoreSlim groupLock = new(1, 1);
-    private readonly string consumerName = string.IsNullOrWhiteSpace(redisOptions.Value.ConsumerName)
-        ? $"{Environment.MachineName}-{Environment.ProcessId}-{Guid.NewGuid():N}"
-        : redisOptions.Value.ConsumerName;
+    private readonly string consumerName = CreateConsumerName(redisOptions.Value.ConsumerName);
     private bool groupCreated;
     private RedisValue autoClaimCursor = "0-0";
 
@@ -136,10 +134,21 @@ internal sealed class RedisAsyncRequestReplyStore(
 
                 return;
             }
-            catch (TimeoutException)
+            catch (TimeoutException ex)
             {
                 _ = ObserveAmbiguousSubmissionAsync(submission!, jobId);
-                return;
+                throw new AsyncQueueUnavailableException(
+                    "The Redis job stream is temporarily unavailable.",
+                    ex);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                if (submission is not null)
+                {
+                    _ = ObserveAmbiguousSubmissionAsync(submission, jobId);
+                }
+
+                throw;
             }
             catch (Exception ex) when (IsTransient(ex))
             {
@@ -160,6 +169,15 @@ internal sealed class RedisAsyncRequestReplyStore(
                     cancellationToken);
             }
         }
+    }
+
+    private static string CreateConsumerName(string? configuredName)
+    {
+        var prefix = string.IsNullOrWhiteSpace(configuredName)
+            ? $"{Environment.MachineName}-{Environment.ProcessId}"
+            : configuredName;
+
+        return $"{prefix}-{Guid.NewGuid():N}";
     }
 
     public async ValueTask EnqueueAsync(
@@ -512,7 +530,7 @@ internal sealed class RedisAsyncRequestReplyStore(
         {
             logger.LogWarning(
                 ex,
-                "Redis submission for job {JobId} failed after the HTTP acceptance timeout elapsed.",
+                "Redis submission for job {JobId} failed after the caller stopped waiting for its result.",
                 jobId);
         }
     }

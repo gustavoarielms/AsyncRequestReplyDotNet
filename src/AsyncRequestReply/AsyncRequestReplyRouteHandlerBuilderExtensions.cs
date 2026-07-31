@@ -1,6 +1,9 @@
+using System.Security.Cryptography;
+using System.Text;
 using System.Text.Json;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.WebUtilities;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Options;
 using AsyncRequestReply.Internal;
@@ -9,6 +12,9 @@ namespace AsyncRequestReply;
 
 public static class AsyncRequestReplyRouteHandlerBuilderExtensions
 {
+    private const int MinimumIdempotencyKeyBytes = 16;
+    private const int MaximumIdempotencyKeyBytes = 256;
+
     public static RouteHandlerBuilder AsAsyncRequestReply(
         this RouteHandlerBuilder builder,
         Action<AsyncEndpointOptions>? configure = null)
@@ -27,6 +33,16 @@ public static class AsyncRequestReplyRouteHandlerBuilderExtensions
         {
             var httpContext = context.HttpContext;
             var cancellationToken = httpContext.RequestAborted;
+            var idempotencyKey = ReadIdempotencyKey(httpContext.Request);
+
+            if (idempotencyKey is null)
+            {
+                return Results.BadRequest(new
+                {
+                    error = $"Idempotency-Key must contain between {MinimumIdempotencyKeyBytes} and {MaximumIdempotencyKeyBytes} UTF-8 bytes."
+                });
+            }
+
             object? payload;
 
             try
@@ -58,11 +74,12 @@ public static class AsyncRequestReplyRouteHandlerBuilderExtensions
                 });
             }
 
-            var jobId = Guid.NewGuid().ToString("N");
+            var submissionIdentity = CreateSubmissionIdentity(httpContext.Request, idempotencyKey);
+            var jobId = submissionIdentity.JobId;
             var submissionStore = httpContext.RequestServices.GetRequiredService<IAsyncJobSubmissionStore>();
             var requestReplyOptions = httpContext.RequestServices.GetRequiredService<IOptions<AsyncRequestReplyOptions>>();
             var accessToken = requestReplyOptions.Value.AllowCapabilityStatusAccess
-                ? StatusAccessToken.Create()
+                ? submissionIdentity.AccessToken
                 : null;
             var location = StatusLocationBuilder.Build(requestReplyOptions, jobId, accessToken);
 
@@ -89,5 +106,40 @@ public static class AsyncRequestReplyRouteHandlerBuilderExtensions
         });
 
         return builder;
+    }
+
+    private static string? ReadIdempotencyKey(HttpRequest request)
+    {
+        var values = request.Headers["Idempotency-Key"];
+
+        if (values.Count != 1)
+        {
+            return null;
+        }
+
+        var value = values[0];
+
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return null;
+        }
+
+        var byteCount = Encoding.UTF8.GetByteCount(value);
+        return byteCount is >= MinimumIdempotencyKeyBytes and <= MaximumIdempotencyKeyBytes
+            ? value
+            : null;
+    }
+
+    private static (string JobId, string AccessToken) CreateSubmissionIdentity(
+        HttpRequest request,
+        string idempotencyKey)
+    {
+        var scope = $"{request.Method}\n{request.PathBase}{request.Path}\n{idempotencyKey}";
+        var jobHash = SHA256.HashData(Encoding.UTF8.GetBytes($"async-request-reply:job\n{scope}"));
+        var accessHash = SHA256.HashData(Encoding.UTF8.GetBytes($"async-request-reply:access\n{scope}"));
+
+        return (
+            Convert.ToHexString(jobHash.AsSpan(0, 16)).ToLowerInvariant(),
+            WebEncoders.Base64UrlEncode(accessHash));
     }
 }
