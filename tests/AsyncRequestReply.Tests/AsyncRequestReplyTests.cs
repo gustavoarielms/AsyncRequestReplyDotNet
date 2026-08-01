@@ -2,6 +2,8 @@ using System.Diagnostics;
 using System.Net;
 using System.Net.Http.Json;
 using System.Runtime.CompilerServices;
+using System.Security.Cryptography;
+using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Threading.Channels;
@@ -10,6 +12,7 @@ using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Hosting.Server;
 using Microsoft.AspNetCore.Hosting.Server.Features;
 using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.WebUtilities;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Options;
@@ -19,6 +22,9 @@ namespace AsyncRequestReply.Tests;
 
 public sealed class AsyncRequestReplyTests
 {
+    private const string TestSubmissionIdentitySecret =
+        "async-request-reply-test-submission-identity-secret";
+
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web)
     {
         Converters = { new JsonStringEnumConverter() }
@@ -98,6 +104,44 @@ public sealed class AsyncRequestReplyTests
 
         Assert.Equal(first.Id, second.Id);
         Assert.Equal(first.Location, second.Location);
+    }
+
+    [Fact]
+    public async Task AsyncEndpoint_CapabilityCannotBeDerivedFromIdempotencyKeyAlone()
+    {
+        await using var app = await TestApp.StartAsync();
+        const string idempotencyKey = "0000000000000000";
+
+        var accepted = await PostOrderAsync(app.Client, idempotencyKey: idempotencyKey);
+        var scope = $"POST\n/orders\n{idempotencyKey}";
+        var publicDigest = SHA256.HashData(
+            Encoding.UTF8.GetBytes($"async-request-reply:access\n{scope}"));
+        var publiclyDerivableToken = WebEncoders.Base64UrlEncode(publicDigest);
+
+        Assert.NotEqual(publiclyDerivableToken, accepted.Location.Split('/').Last());
+    }
+
+    [Fact]
+    public async Task AsyncEndpoint_ServerSecretScopesCapabilityWithoutChangingJobId()
+    {
+        var idempotencyKey = Guid.NewGuid().ToString("N");
+        await using var firstApp = await TestApp.StartAsync(
+            configureOptions: options =>
+                options.SubmissionIdentitySecret = $"{TestSubmissionIdentitySecret}-first");
+        await using var secondApp = await TestApp.StartAsync(
+            configureOptions: options =>
+                options.SubmissionIdentitySecret = $"{TestSubmissionIdentitySecret}-second");
+        await using var matchingApp = await TestApp.StartAsync(
+            configureOptions: options =>
+                options.SubmissionIdentitySecret = $"{TestSubmissionIdentitySecret}-first");
+
+        var first = await PostOrderAsync(firstApp.Client, idempotencyKey: idempotencyKey);
+        var second = await PostOrderAsync(secondApp.Client, idempotencyKey: idempotencyKey);
+        var matching = await PostOrderAsync(matchingApp.Client, idempotencyKey: idempotencyKey);
+
+        Assert.Equal(first.Id, second.Id);
+        Assert.NotEqual(first.Location.Split('/').Last(), second.Location.Split('/').Last());
+        Assert.Equal(first.Location, matching.Location);
     }
 
     [Fact]
@@ -356,6 +400,113 @@ public sealed class AsyncRequestReplyTests
             TestContext.Current.CancellationToken);
 
         Assert.NotNull(await statusStore.GetAsync("job-b", TestContext.Current.CancellationToken));
+    }
+
+    [Fact]
+    public async Task InMemorySubmission_ConcurrentDuplicateSharesQueueFailure()
+    {
+        var services = new ServiceCollection();
+        services.AddLogging();
+        services.AddAsyncRequestReply(options =>
+        {
+            options.QueueCapacity = 1;
+            options.EnqueueTimeout = TimeSpan.FromMilliseconds(200);
+        });
+        await using var provider = services.BuildServiceProvider();
+        var submissionStore = provider.GetRequiredService<IAsyncJobSubmissionStore>();
+        var statusStore = provider.GetRequiredService<IAsyncStatusStore>();
+
+        await submissionStore.SubmitAsync(
+            "blocker",
+            new { value = 0 },
+            AsyncExecutionMode.resolve_now,
+            "blocker-token",
+            TestContext.Current.CancellationToken);
+        var original = submissionStore.SubmitAsync(
+            "same-job",
+            new { value = 1 },
+            AsyncExecutionMode.resolve_now,
+            "same-token",
+            TestContext.Current.CancellationToken).AsTask();
+
+        while (await statusStore.GetAsync(
+            "same-job",
+            TestContext.Current.CancellationToken) is null)
+        {
+            await Task.Yield();
+        }
+
+        var duplicate = submissionStore.SubmitAsync(
+            "same-job",
+            new { value = 2 },
+            AsyncExecutionMode.resolve_now,
+            "same-token",
+            TestContext.Current.CancellationToken).AsTask();
+
+        await Assert.ThrowsAsync<AsyncQueueUnavailableException>(() => original);
+        await Assert.ThrowsAsync<AsyncQueueUnavailableException>(() => duplicate);
+        Assert.Null(await statusStore.GetAsync(
+            "same-job",
+            TestContext.Current.CancellationToken));
+    }
+
+    [Fact]
+    public async Task InMemorySubmission_CallerCancellationDoesNotCancelSharedAdmission()
+    {
+        var services = new ServiceCollection();
+        services.AddLogging();
+        services.AddAsyncRequestReply(options =>
+        {
+            options.QueueCapacity = 1;
+            options.EnqueueTimeout = TimeSpan.FromSeconds(1);
+        });
+        await using var provider = services.BuildServiceProvider();
+        var submissionStore = provider.GetRequiredService<IAsyncJobSubmissionStore>();
+        var reader = provider.GetRequiredService<IAsyncJobQueueReader>();
+        var statusStore = provider.GetRequiredService<IAsyncStatusStore>();
+
+        await submissionStore.SubmitAsync(
+            "blocker",
+            new { value = 0 },
+            AsyncExecutionMode.resolve_now,
+            "blocker-token",
+            TestContext.Current.CancellationToken);
+        using var callerCancellation = new CancellationTokenSource(TimeSpan.FromMilliseconds(100));
+        var canceledCaller = submissionStore.SubmitAsync(
+            "same-job",
+            new { value = 1 },
+            AsyncExecutionMode.resolve_now,
+            "same-token",
+            callerCancellation.Token).AsTask();
+
+        while (await statusStore.GetAsync(
+            "same-job",
+            TestContext.Current.CancellationToken) is null)
+        {
+            await Task.Yield();
+        }
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => canceledCaller);
+        Assert.NotNull(await statusStore.GetAsync(
+            "same-job",
+            TestContext.Current.CancellationToken));
+        var blocker = await ReadOneAsync(reader);
+        Assert.Equal("blocker", blocker.Job.Id);
+        await reader.CompleteAsync(blocker, TestContext.Current.CancellationToken);
+
+        await submissionStore.SubmitAsync(
+            "same-job",
+            new { value = 2 },
+            AsyncExecutionMode.resolve_now,
+            "same-token",
+            TestContext.Current.CancellationToken);
+        var accepted = await ReadOneAsync(reader);
+
+        Assert.Equal("same-job", accepted.Job.Id);
+        Assert.NotNull(await statusStore.GetAsync(
+            "same-job",
+            TestContext.Current.CancellationToken));
+        await reader.CompleteAsync(accepted, TestContext.Current.CancellationToken);
     }
 
     [Fact]
@@ -685,6 +836,20 @@ public sealed class AsyncRequestReplyTests
 
         Assert.Throws<OptionsValidationException>(
             () => provider.GetRequiredService<IOptions<AsyncRequestReplyOptions>>().Value);
+    }
+
+    [Fact]
+    public void CapabilityAccessWithoutSubmissionIdentitySecret_IsRejected()
+    {
+        var services = new ServiceCollection();
+        services.AddLogging();
+        services.AddAsyncRequestReply(options => options.AllowCapabilityStatusAccess = true);
+        using var provider = services.BuildServiceProvider();
+
+        var exception = Assert.Throws<OptionsValidationException>(
+            () => provider.GetRequiredService<IOptions<AsyncRequestReplyOptions>>().Value);
+
+        Assert.Contains("SubmissionIdentitySecret", exception.Message);
     }
 
     [Fact]
@@ -1390,6 +1555,66 @@ public sealed class AsyncRequestReplyTests
             var recovered = await ReadOneAsync(reader);
 
             Assert.Equal("after-reset", recovered.Job.Id);
+        }
+        finally
+        {
+            await database.KeyDeleteAsync(streamKey);
+        }
+    }
+
+    [Fact]
+    [Trait("Category", "RedisIntegration")]
+    public async Task RedisMalformedCleanup_ToleratesLeaseLossAndRecoversNoGroup()
+    {
+        var configuration = Environment.GetEnvironmentVariable("ASYNC_REQUEST_REPLY_REDIS_CONNECTION");
+
+        if (string.IsNullOrWhiteSpace(configuration))
+        {
+            Assert.Skip("Set ASYNC_REQUEST_REPLY_REDIS_CONNECTION to run the Redis integration test.");
+        }
+
+        var suffix = Guid.NewGuid().ToString("N");
+        var streamKey = $"async-request-reply:{{{suffix}}}:jobs";
+        var statusPrefix = $"async-request-reply:{{{suffix}}}:status:";
+        var group = $"group-{suffix}";
+        var services = new ServiceCollection();
+        services.AddLogging();
+        services.AddAsyncRequestReply(options =>
+        {
+            options.DeliveryLeaseRenewalInterval = TimeSpan.FromMilliseconds(10);
+        });
+        services.AddAsyncRequestReplyRedis(options =>
+        {
+            options.Configuration = configuration;
+            options.StreamKey = streamKey;
+            options.ConsumerGroup = group;
+            options.StatusKeyPrefix = statusPrefix;
+            options.QueuePollInterval = TimeSpan.FromMilliseconds(10);
+            options.ClaimIdleTime = TimeSpan.FromMilliseconds(50);
+        });
+        await using var provider = services.BuildServiceProvider();
+        var store = provider.GetRequiredService<RedisAsyncRequestReplyStore>();
+        var queue = provider.GetRequiredService<IAsyncJobQueue>();
+        var connection = provider.GetRequiredService<StackExchange.Redis.IConnectionMultiplexer>();
+        var database = connection.GetDatabase();
+
+        try
+        {
+            await database.StreamAddAsync(streamKey, "seed", "value");
+            await database.StreamCreateConsumerGroupAsync(streamKey, group, "0-0");
+
+            await store.DiscardMalformedDeliveryAsync("9999999999999-0");
+            await database.KeyDeleteAsync(streamKey);
+            await store.DiscardMalformedDeliveryAsync("9999999999999-0");
+
+            await queue.EnqueueAsync(
+                "after-cleanup",
+                new { value = 1 },
+                AsyncExecutionMode.resolve_now,
+                TestContext.Current.CancellationToken);
+            var recovered = await ReadOneAsync(store);
+
+            Assert.Equal("after-cleanup", recovered.Job.Id);
         }
         finally
         {
@@ -2223,6 +2448,7 @@ public sealed class AsyncRequestReplyTests
             {
                 options.StatusBasePath = "/async-status";
                 options.AllowCapabilityStatusAccess = true;
+                options.SubmissionIdentitySecret = TestSubmissionIdentitySecret;
                 options.ExternalResolutionInterval = TimeSpan.FromMilliseconds(10);
                 configureOptions?.Invoke(options);
             });

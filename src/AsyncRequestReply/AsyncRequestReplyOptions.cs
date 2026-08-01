@@ -6,6 +6,8 @@ public sealed class AsyncRequestReplyOptions
 
     public bool AllowCapabilityStatusAccess { get; set; }
 
+    public string? SubmissionIdentitySecret { get; set; }
+
     public int QueueCapacity { get; set; } = 1_000;
 
     public TimeSpan EnqueueTimeout { get; set; } = TimeSpan.FromSeconds(2);

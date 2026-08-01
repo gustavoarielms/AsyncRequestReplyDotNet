@@ -229,8 +229,7 @@ internal sealed class RedisAsyncRequestReplyStore(
                     ex,
                     "Redis consumer group {ConsumerGroup} disappeared. Recreating it before continuing.",
                     options.ConsumerGroup);
-                groupCreated = false;
-                autoClaimCursor = "0-0";
+                ResetConsumerGroupState();
                 continue;
             }
             catch (Exception ex) when (IsTransient(ex))
@@ -265,21 +264,41 @@ internal sealed class RedisAsyncRequestReplyStore(
 
             if (job is null)
             {
-                try
-                {
-                    await CompleteDeliveryAsync(entry.Value.Id);
-                }
-                catch (Exception ex) when (IsTransient(ex))
-                {
-                    throw new AsyncQueueUnavailableException(
-                        "The Redis job stream is temporarily unavailable.",
-                        ex);
-                }
-
+                await DiscardMalformedDeliveryAsync(entry.Value.Id);
                 continue;
             }
 
             yield return new AsyncJobDelivery(entry.Value.Id.ToString(), job);
+        }
+    }
+
+    internal async Task DiscardMalformedDeliveryAsync(RedisValue deliveryId)
+    {
+        try
+        {
+            await CompleteDeliveryAsync(deliveryId);
+        }
+        catch (AsyncDeliveryLeaseLostException ex)
+        {
+            logger.LogDebug(
+                ex,
+                "Malformed Redis delivery {DeliveryId} was already handled by another consumer.",
+                deliveryId);
+        }
+        catch (RedisServerException ex) when (IsNoGroup(ex))
+        {
+            logger.LogWarning(
+                ex,
+                "Redis consumer group {ConsumerGroup} disappeared while discarding malformed delivery {DeliveryId}.",
+                options.ConsumerGroup,
+                deliveryId);
+            ResetConsumerGroupState();
+        }
+        catch (Exception ex) when (IsTransient(ex))
+        {
+            throw new AsyncQueueUnavailableException(
+                "The Redis job stream is temporarily unavailable.",
+                ex);
         }
     }
 
@@ -516,6 +535,12 @@ internal sealed class RedisAsyncRequestReplyStore(
     private static bool IsNoGroup(RedisServerException exception)
     {
         return exception.Message.StartsWith("NOGROUP", StringComparison.Ordinal);
+    }
+
+    private void ResetConsumerGroupState()
+    {
+        groupCreated = false;
+        autoClaimCursor = "0-0";
     }
 
     private async Task ObserveAmbiguousSubmissionAsync(

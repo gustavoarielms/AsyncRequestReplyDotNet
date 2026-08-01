@@ -23,6 +23,11 @@ public static class AsyncRequestReplyServiceCollectionExtensions
             .Validate(value => value.EnqueueTimeout > TimeSpan.Zero, "EnqueueTimeout must be greater than zero.")
             .Validate(value => value.StatusCapacity > 0, "StatusCapacity must be greater than zero.")
             .Validate(value => value.StatusTimeToLive > TimeSpan.Zero, "StatusTimeToLive must be greater than zero.")
+            .Validate(
+                value => !value.AllowCapabilityStatusAccess
+                    || value.SubmissionIdentitySecret is { } secret
+                    && System.Text.Encoding.UTF8.GetByteCount(secret) >= 32,
+                "SubmissionIdentitySecret must contain at least 32 UTF-8 bytes when capability status access is enabled.")
             .Validate(value => value.WorkerConcurrency > 0, "WorkerConcurrency must be greater than zero.")
             .Validate(
                 value => value.WorkerRecoveryInterval > TimeSpan.Zero,

@@ -31,6 +31,8 @@ builder.Services.AddAsyncRequestReply(options =>
 {
     options.StatusBasePath = "/async-status";
     options.AllowCapabilityStatusAccess = true;
+    options.SubmissionIdentitySecret = builder.Configuration["AsyncRequestReply:SubmissionIdentitySecret"]
+        ?? throw new InvalidOperationException("Configure a stable submission identity secret.");
     options.QueueCapacity = 1_000;
     options.StatusTimeToLive = TimeSpan.FromHours(1);
     options.WorkerRecoveryInterval = TimeSpan.FromSeconds(1);
@@ -63,6 +65,8 @@ builder.Services.AddAsyncRequestReply(options =>
 {
     options.StatusBasePath = "/async-status";
     options.AllowCapabilityStatusAccess = true;
+    options.SubmissionIdentitySecret = builder.Configuration["AsyncRequestReply:SubmissionIdentitySecret"]
+        ?? throw new InvalidOperationException("Configure a stable submission identity secret.");
 });
 
 builder.Services.AddAsyncRequestReplyRedis(options =>
@@ -100,9 +104,11 @@ The endpoint marked with `.AsAsyncRequestReply(...)` reads the request body, ext
 }
 ```
 
-The HTTP response status is `202 Accepted` and the `Location` header contains the polling URL. The access token is derived separately from the job identifier and only its SHA-256 hash is stored.
+The HTTP response status is `202 Accepted` and the `Location` header contains the polling URL. The access token is derived with HMAC-SHA-256 from a server secret and only its SHA-256 hash is stored.
 
 Every submission requires exactly one HTTP `Idempotency-Key` containing 16 to 256 UTF-8 bytes. Generate it with a cryptographically secure random source (a UUID is sufficient) and reuse it after `503`, a connection loss, or client-side cancellation. The method and route scope the key: while its status is retained, retries return the same `jobId` and polling location, and the first accepted payload wins. Missing or invalid keys return `400 Bad Request`.
+
+When `AllowCapabilityStatusAccess` is enabled, `SubmissionIdentitySecret` is required and must contain at least 32 UTF-8 bytes from a cryptographically secure source. Keep it outside source control, share the same value across all replicas, and keep it stable for at least as long as statuses may be retained. Rotating it immediately invalidates capability URLs returned with the previous value.
 
 With `PayloadPath = "data"`, this request enqueues only the nested `data` object:
 
@@ -179,7 +185,7 @@ Status responses include `Cache-Control: no-store`. The GET endpoint is read-onl
 
 ## Limits and retention
 
-The in-memory queue and status store are bounded. `AsyncRequestReplyOptions` controls queue capacity and enqueue timeout, status capacity and terminal-state TTL, worker concurrency and recovery, delivery lease renewal, and external-resolution retry behavior. Queue capacity remains reserved until a delivery completes, so a redelivery can always be returned to the channel. Active jobs do not expire while queued or processing. When `StatusCapacity` is reached, expired entries are removed first and then the oldest retained terminal pair (status plus capability) is evicted. If every entry is active, the new submission returns `503 Service Unavailable`; an accepted active job is never evicted. A full queue also returns `503` with `Retry-After`; an oversized endpoint payload returns `413 Payload Too Large`.
+The in-memory queue and status store are bounded. `AsyncRequestReplyOptions` controls queue capacity and enqueue timeout, status capacity and terminal-state TTL, worker concurrency and recovery, delivery lease renewal, and external-resolution retry behavior. Queue capacity remains reserved until a delivery completes, so a redelivery can always be returned to the channel. Concurrent submissions for the same `jobId` share one admission result; canceling one caller does not cancel the bounded shared operation. Active jobs do not expire while queued or processing. When `StatusCapacity` is reached, expired entries are removed first and then the oldest retained terminal pair (status plus capability) is evicted. If every entry is active, the new submission returns `503 Service Unavailable`; an accepted active job is never evicted. A full queue also returns `503` with `Retry-After`; an oversized endpoint payload returns `413 Payload Too Large`.
 
 ## Commands
 

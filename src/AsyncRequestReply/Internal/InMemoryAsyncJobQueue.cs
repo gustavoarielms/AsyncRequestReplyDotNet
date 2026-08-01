@@ -13,6 +13,8 @@ internal sealed class InMemoryAsyncJobQueue :
     private readonly TimeSpan enqueueTimeout;
     private readonly SemaphoreSlim admissionSlots;
     private readonly InMemoryAsyncStatusStore statusStore;
+    private readonly Dictionary<string, Task> submissions = new();
+    private readonly object submissionLock = new();
 
     public InMemoryAsyncJobQueue(
         IOptions<AsyncRequestReplyOptions> options,
@@ -36,21 +38,83 @@ internal sealed class InMemoryAsyncJobQueue :
         string? accessToken,
         CancellationToken cancellationToken = default)
     {
-        var admitted = await statusStore.AdmitAsync(jobId, accessToken, cancellationToken);
+        cancellationToken.ThrowIfCancellationRequested();
+        Task submission;
+        TaskCompletionSource? owner = null;
 
-        if (!admitted)
+        lock (submissionLock)
         {
-            return;
+            if (!submissions.TryGetValue(jobId, out submission!))
+            {
+                owner = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                submission = owner.Task;
+                submissions.Add(jobId, submission);
+            }
         }
+
+        if (owner is not null)
+        {
+            _ = RunSubmissionAsync(
+                jobId,
+                payload,
+                executionMode,
+                accessToken,
+                submission,
+                owner);
+        }
+
+        await submission.WaitAsync(cancellationToken);
+    }
+
+    private async Task RunSubmissionAsync(
+        string jobId,
+        object? payload,
+        AsyncExecutionMode executionMode,
+        string? accessToken,
+        Task submission,
+        TaskCompletionSource completion)
+    {
+        Exception? error = null;
 
         try
         {
-            await EnqueueAsync(jobId, payload, executionMode, cancellationToken);
+            var admitted = await statusStore.AdmitAsync(jobId, accessToken, CancellationToken.None);
+
+            if (admitted)
+            {
+                try
+                {
+                    await EnqueueAsync(jobId, payload, executionMode, CancellationToken.None);
+                }
+                catch
+                {
+                    await statusStore.DeleteAsync(jobId, CancellationToken.None);
+                    throw;
+                }
+            }
         }
-        catch
+        catch (Exception ex)
         {
-            await statusStore.DeleteAsync(jobId, CancellationToken.None);
-            throw;
+            error = ex;
+        }
+
+        lock (submissionLock)
+        {
+            if (submissions.TryGetValue(jobId, out var current)
+                && ReferenceEquals(current, submission))
+            {
+                submissions.Remove(jobId);
+            }
+        }
+
+        if (error is null)
+        {
+            completion.TrySetResult();
+        }
+        else
+        {
+            completion.TrySetException(error);
+            _ = completion.Task.Exception;
         }
     }
 

@@ -74,12 +74,12 @@ public static class AsyncRequestReplyRouteHandlerBuilderExtensions
                 });
             }
 
-            var submissionIdentity = CreateSubmissionIdentity(httpContext.Request, idempotencyKey);
-            var jobId = submissionIdentity.JobId;
-            var submissionStore = httpContext.RequestServices.GetRequiredService<IAsyncJobSubmissionStore>();
             var requestReplyOptions = httpContext.RequestServices.GetRequiredService<IOptions<AsyncRequestReplyOptions>>();
+            var scope = CreateSubmissionScope(httpContext.Request, idempotencyKey);
+            var jobId = CreateJobId(scope);
+            var submissionStore = httpContext.RequestServices.GetRequiredService<IAsyncJobSubmissionStore>();
             var accessToken = requestReplyOptions.Value.AllowCapabilityStatusAccess
-                ? submissionIdentity.AccessToken
+                ? CreateAccessToken(scope, requestReplyOptions.Value.SubmissionIdentitySecret!)
                 : null;
             var location = StatusLocationBuilder.Build(requestReplyOptions, jobId, accessToken);
 
@@ -130,16 +130,24 @@ public static class AsyncRequestReplyRouteHandlerBuilderExtensions
             : null;
     }
 
-    private static (string JobId, string AccessToken) CreateSubmissionIdentity(
+    private static string CreateSubmissionScope(
         HttpRequest request,
         string idempotencyKey)
     {
-        var scope = $"{request.Method}\n{request.PathBase}{request.Path}\n{idempotencyKey}";
-        var jobHash = SHA256.HashData(Encoding.UTF8.GetBytes($"async-request-reply:job\n{scope}"));
-        var accessHash = SHA256.HashData(Encoding.UTF8.GetBytes($"async-request-reply:access\n{scope}"));
+        return $"{request.Method}\n{request.PathBase}{request.Path}\n{idempotencyKey}";
+    }
 
-        return (
-            Convert.ToHexString(jobHash.AsSpan(0, 16)).ToLowerInvariant(),
-            WebEncoders.Base64UrlEncode(accessHash));
+    private static string CreateJobId(string scope)
+    {
+        var jobHash = SHA256.HashData(Encoding.UTF8.GetBytes($"async-request-reply:job\n{scope}"));
+        return Convert.ToHexString(jobHash.AsSpan(0, 16)).ToLowerInvariant();
+    }
+
+    private static string CreateAccessToken(string scope, string secret)
+    {
+        var accessHash = HMACSHA256.HashData(
+            Encoding.UTF8.GetBytes(secret),
+            Encoding.UTF8.GetBytes($"async-request-reply:access\n{scope}"));
+        return WebEncoders.Base64UrlEncode(accessHash);
     }
 }
