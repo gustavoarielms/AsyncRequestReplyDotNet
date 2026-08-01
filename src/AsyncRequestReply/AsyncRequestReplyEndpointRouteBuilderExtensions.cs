@@ -9,23 +9,33 @@ namespace AsyncRequestReply;
 
 public static class AsyncRequestReplyEndpointRouteBuilderExtensions
 {
-    public static IEndpointRouteBuilder MapAsyncRequestReplyStatusEndpoints(this IEndpointRouteBuilder endpoints)
+    public static RouteHandlerBuilder MapAsyncRequestReplyStatusEndpoints(this IEndpointRouteBuilder endpoints)
     {
         var options = endpoints.ServiceProvider.GetRequiredService<IOptions<AsyncRequestReplyOptions>>().Value;
-
-        if (!options.ExposeStatusEndpoint)
-        {
-            return endpoints;
-        }
-
         var basePath = NormalizeBasePath(options.StatusBasePath);
 
-        endpoints.MapGet($"{basePath}/status/{{jobId}}", async (
+        return endpoints.MapGet($"{basePath}/status/{{jobId}}/{{accessToken?}}", async (
+            HttpContext httpContext,
             string jobId,
+            string? accessToken,
             IAsyncStatusStore statusStore,
-            IEnumerable<IExternalStatusResolver> resolvers,
+            IAsyncStatusTokenStore tokenStore,
             CancellationToken cancellationToken) =>
         {
+            httpContext.Response.Headers.CacheControl = "no-store";
+
+            var accessPolicy = httpContext.RequestServices.GetService<IAsyncStatusAccessPolicy>();
+            var canRead = accessPolicy is not null
+                ? await accessPolicy.CanReadAsync(httpContext, jobId, cancellationToken)
+                : options.AllowCapabilityStatusAccess
+                    && !string.IsNullOrWhiteSpace(accessToken)
+                    && await tokenStore.ValidateAsync(jobId, accessToken, cancellationToken);
+
+            if (!canRead)
+            {
+                return Results.NotFound(StatusResponseFactory.NotFound(jobId));
+            }
+
             var status = await statusStore.GetAsync(jobId, cancellationToken);
 
             if (status is null)
@@ -33,24 +43,8 @@ public static class AsyncRequestReplyEndpointRouteBuilderExtensions
                 return Results.NotFound(StatusResponseFactory.NotFound(jobId));
             }
 
-            if (status.Status == AsyncJobStatus.waiting_external)
-            {
-                var resolver = resolvers.FirstOrDefault();
-                var resolved = resolver is null
-                    ? null
-                    : await resolver.ResolveAsync(jobId, status, cancellationToken);
-
-                if (resolved is not null)
-                {
-                    await statusStore.SetAsync(resolved, cancellationToken);
-                    status = resolved;
-                }
-            }
-
             return Results.Ok(status);
         });
-
-        return endpoints;
     }
 
     private static string NormalizeBasePath(string basePath)

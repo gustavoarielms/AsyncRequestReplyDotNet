@@ -1,0 +1,23 @@
+@AsyncRequestReply_NuGetSampleApi_HostAddress = http://localhost:5088
+
+GET {{AsyncRequestReply_NuGetSampleApi_HostAddress}}/
+Accept: application/json
+
+###
+
+POST {{AsyncRequestReply_NuGetSampleApi_HostAddress}}/invoices
+Content-Type: application/json
+Idempotency-Key: 550e8400-e29b-41d4-a716-446655440000
+
+{
+  "data": {
+    "number": "INV-1001",
+    "customer": "Patxa",
+    "amount": 1250.75
+  }
+}
+
+###
+
+GET {{AsyncRequestReply_NuGetSampleApi_HostAddress}}/async-status/status/{{jobId}}/{{accessToken}}
+Accept: application/json

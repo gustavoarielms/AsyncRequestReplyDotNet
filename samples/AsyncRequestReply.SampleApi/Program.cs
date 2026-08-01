@@ -1,11 +1,15 @@
+using System.Security.Cryptography;
 using AsyncRequestReply;
 
 var builder = WebApplication.CreateBuilder(args);
+var submissionIdentitySecret = builder.Configuration["AsyncRequestReply:SubmissionIdentitySecret"]
+    ?? Convert.ToBase64String(RandomNumberGenerator.GetBytes(32));
 
 builder.Services.AddAsyncRequestReply(options =>
 {
     options.StatusBasePath = "/async-status";
-    options.ExposeStatusEndpoint = true;
+    options.AllowCapabilityStatusAccess = true;
+    options.SubmissionIdentitySecret = submissionIdentitySecret;
 });
 builder.Services.AddSingleton<IAsyncJobProcessor, OrderProcessor>();
 

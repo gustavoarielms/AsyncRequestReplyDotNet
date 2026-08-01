@@ -5,6 +5,7 @@ on:
     tags:
       - "v*"
   workflow_dispatch:
+  workflow_call:
 
 jobs:
   publish:
@@ -12,13 +13,23 @@ jobs:
     permissions:
       contents: read
       id-token: write
+    services:
+      redis:
+        image: redis:7.4.2
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Setup .NET
-        uses: actions/setup-dotnet@v4
+        uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4
         with:
           dotnet-version: 8.0.x
 
@@ -30,13 +41,34 @@ jobs:
 
       - name: Run tests
         run: dotnet test AsyncRequestReply.sln --configuration Release --no-build
+        env:
+          ASYNC_REQUEST_REPLY_REDIS_CONNECTION: localhost:6379
 
       - name: Pack library
         run: dotnet pack src/AsyncRequestReply/AsyncRequestReply.csproj --configuration Release --no-build --output ./artifacts
 
+      - name: Read package version
+        id: package
+        run: echo "version=$(dotnet msbuild src/AsyncRequestReply/AsyncRequestReply.csproj -getProperty:Version)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore NuGet sample from packed artifact
+        run: >-
+          dotnet restore
+          samples/AsyncRequestReply.NuGetSampleApi/AsyncRequestReply.NuGetSampleApi.csproj
+          --configfile samples/AsyncRequestReply.NuGetSampleApi/NuGet.config
+          -p:AsyncRequestReplyPackageVersion=${{ steps.package.outputs.version }}
+
+      - name: Build NuGet sample
+        run: >-
+          dotnet build
+          samples/AsyncRequestReply.NuGetSampleApi/AsyncRequestReply.NuGetSampleApi.csproj
+          --configuration Release
+          --no-restore
+          -p:AsyncRequestReplyPackageVersion=${{ steps.package.outputs.version }}
+
       - name: NuGet login
         id: login
-        uses: NuGet/login@v1
+        uses: NuGet/login@8d196754b4036150537f80ac539e15c2f1028841 # v1
         with:
           user: gustavoarielms
 

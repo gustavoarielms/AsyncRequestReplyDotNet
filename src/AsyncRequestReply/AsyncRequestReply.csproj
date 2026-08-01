@@ -5,22 +5,27 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <PackageId>AsyncRequestReply</PackageId>
-    <Version>0.1.0</Version>
+    <Version>0.2.0</Version>
     <Authors>Gustavo Ariel M. S.</Authors>
     <Description>ASP.NET Core helpers for asynchronous request-reply HTTP flows.</Description>
     <PackageReadmeFile>README.md</PackageReadmeFile>
     <PackageProjectUrl>https://github.com/gustavoarielms/AsyncRequestReplyDotNet</PackageProjectUrl>
     <RepositoryUrl>https://github.com/gustavoarielms/AsyncRequestReplyDotNet</RepositoryUrl>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
-    <PackageTags>aspnetcore;async;request-reply;background-jobs;http</PackageTags>
+    <PackageTags>aspnetcore;async;request-reply;background-jobs;http;redis;distributed-systems;polling;minimal-api</PackageTags>
   </PropertyGroup>
 
   <ItemGroup>
     <FrameworkReference Include="Microsoft.AspNetCore.App" />
+    <PackageReference Include="StackExchange.Redis" Version="3.0.17" />
   </ItemGroup>
 
   <ItemGroup>
     <None Include="..\..\README.md" Pack="true" PackagePath="\" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="AsyncRequestReply.Tests" />
   </ItemGroup>
 
 </Project>

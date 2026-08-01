@@ -7,47 +7,25 @@ on:
   workflow_dispatch:
 
 jobs:
-  release-please:
+  release_please:
     runs-on: ubuntu-24.04
     permissions:
       contents: write
       pull-requests: write
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
 
     steps:
       - name: Run release-please
         id: release
-        uses: googleapis/release-please-action@v5.0.0
+        uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
         with:
           release-type: simple
 
-      - name: Checkout repository
-        if: ${{ steps.release.outputs.release_created == 'true' }}
-        uses: actions/checkout@v4
-
-      - name: Setup .NET
-        if: ${{ steps.release.outputs.release_created == 'true' }}
-        uses: actions/setup-dotnet@v4
-        with:
-          dotnet-version: 8.0.x
-
-      - name: Restore dependencies
-        if: ${{ steps.release.outputs.release_created == 'true' }}
-        run: dotnet restore AsyncRequestReply.sln
-
-      - name: Build solution
-        if: ${{ steps.release.outputs.release_created == 'true' }}
-        run: dotnet build AsyncRequestReply.sln --configuration Release --no-restore
-
-      - name: Run tests
-        if: ${{ steps.release.outputs.release_created == 'true' }}
-        run: dotnet test AsyncRequestReply.sln --configuration Release --no-build
-
-      - name: Pack library
-        if: ${{ steps.release.outputs.release_created == 'true' }}
-        run: dotnet pack src/AsyncRequestReply/AsyncRequestReply.csproj --configuration Release --no-build --output ./artifacts
-
-      - name: Publish to NuGet
-        if: ${{ steps.release.outputs.release_created == 'true' }}
-        run: dotnet nuget push "./artifacts/*.nupkg" --api-key "$NUGET_API_KEY" --source https://api.nuget.org/v3/index.json --skip-duplicate
-        env:
-          NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
+  publish:
+    needs: release_please
+    if: ${{ needs.release_please.outputs.release_created == 'true' }}
+    permissions:
+      contents: read
+      id-token: write
+    uses: ./.github/workflows/release.yml

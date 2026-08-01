@@ -1,6 +1,6 @@
-namespace AsyncRequestReply.Internal;
+namespace AsyncRequestReply;
 
-internal sealed record AsyncJob(
+public sealed record AsyncJobEnvelope(
     string Id,
     object? Payload,
     AsyncExecutionMode ExecutionMode);
