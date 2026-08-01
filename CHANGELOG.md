@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.1](https://github.com/gustavoarielms/AsyncRequestReplyDotNet/compare/v0.2.0...v0.2.1) (2026-08-01)
+
+
+### Bug Fixes
+
+* **deps:** require StackExchange.Redis 3.1.0 ([6345b2d](https://github.com/gustavoarielms/AsyncRequestReplyDotNet/commit/6345b2dc9009ccc6aa606642cd141f548e1c7603))
+
 ## [0.2.0](https://github.com/gustavoarielms/AsyncRequestReplyDotNet/compare/v0.1.0...v0.2.0) (2026-08-01)
 
 
